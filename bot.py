@@ -14,7 +14,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, Fast
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from backend.services.supabase_service import update_lead_status
+from services.supabase_service import update_lead_status
 
 import json
 from google.oauth2 import service_account
