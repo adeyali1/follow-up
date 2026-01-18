@@ -24,6 +24,8 @@ def get_google_credentials():
     json_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if json_str:
         logger.info("Loading Google Credentials from JSON string env var")
+        # Ensure proper JSON formatting (replace single quotes with double quotes)
+        json_str = json_str.replace("'", '"')
         info = json.loads(json_str)
         return service_account.Credentials.from_service_account_info(info)
     
