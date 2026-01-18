@@ -1,5 +1,6 @@
 import os
 import sys
+import ast
 from loguru import logger
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -25,36 +26,29 @@ def get_google_credentials():
     if json_str:
         logger.info("Loading Google Credentials from JSON string env var")
         
-        # Debug: Print raw string representation to see hidden chars/escapes
-        logger.info(f"Raw JSON string repr: {repr(json_str)}")
-
-        # Ensure proper JSON formatting (replace single quotes with double quotes)
-        json_str = json_str.replace("'", '"')
-        # Handle potential python-style booleans if pasted from python dict
-        json_str = json_str.replace("True", "true").replace("False", "false")
-        # Unescape double quotes if they were escaped (e.g. \"type\" -> "type")
-        json_str = json_str.replace('\\"', '"')
-        
-        # New: Remove leading/trailing quotes if the whole JSON is quoted
-        json_str = json_str.strip().strip('"').strip("'")
-
-        logger.info(f"Cleaned JSON string repr: {repr(json_str)}")
+        # Basic cleanup of wrapping quotes
+        json_str = json_str.strip().strip("'").strip('"')
 
         try:
+            # Try parsing as standard JSON
             info = json.loads(json_str)
-            
-            # Clean string values (remove accidental backticks or whitespace)
-            for key, value in info.items():
-                if isinstance(value, str):
-                    info[key] = value.replace("`", "").strip()
-
-            if "private_key" in info:
-                info["private_key"] = info["private_key"].replace("\\n", "\n")
-            return info
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse Google Credentials JSON: {e}")
-            logger.error(f"First 100 chars of JSON: {json_str[:100]}")
-            return None
+            logger.info("Successfully parsed credentials as JSON")
+        except json.JSONDecodeError:
+            # Fallback: Try parsing as a Python dictionary string (handles single quotes safely)
+            try:
+                logger.info("JSON decode failed, trying ast.literal_eval")
+                info = ast.literal_eval(json_str)
+            except (ValueError, SyntaxError) as e:
+                logger.error(f"Failed to parse Google Credentials: {e}")
+                logger.error(f"First 100 chars: {json_str[:100]}")
+                return None
+        
+        # Post-processing: Handle private key newlines if needed
+        if "private_key" in info:
+             # Ensure we have actual newlines, not escaped ones
+             info["private_key"] = info["private_key"].replace("\\n", "\n")
+             
+        return info
     
     # Fallback to file path
     path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -69,7 +63,26 @@ def get_google_credentials():
 
 async def run_bot(websocket_client, lead_data, call_control_id=None):
     logger.info(f"Starting bot for lead: {lead_data['id']}")
-    
+
+    # 0. Handle Telnyx Handshake to get stream_id
+    stream_id = "telnyx_stream_placeholder"
+    try:
+        # Telnyx typically sends a JSON payload first with event="connected" or "start"
+        # We need to capture the stream_id from this to send audio back correctly.
+        msg_text = await websocket_client.receive_text()
+        logger.info(f"Received initial Telnyx message: {msg_text}")
+        msg = json.loads(msg_text)
+        
+        # Check standard locations for stream_id
+        if "stream_id" in msg:
+            stream_id = msg["stream_id"]
+        elif "data" in msg and "stream_id" in msg["data"]:
+            stream_id = msg["data"]["stream_id"]
+            
+        logger.info(f"Captured stream_id: {stream_id}")
+    except Exception as e:
+        logger.error(f"Failed to capture stream_id from initial message: {e}")
+
     # Get Credentials (dictionary)
     google_creds_dict = get_google_credentials()
     
@@ -178,7 +191,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     # But for now, let's assume we just want audio streaming working.
     
     serializer = TelnyxFrameSerializer(
-        stream_id="telnyx_stream", # Placeholder
+        stream_id=stream_id, # Captured from handshake
         call_control_id=call_control_id,
         api_key=os.getenv("TELNYX_API_KEY"),
         outbound_encoding="PCMU", # Telnyx default
