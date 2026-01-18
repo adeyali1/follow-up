@@ -24,12 +24,22 @@ def get_google_credentials():
     json_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if json_str:
         logger.info("Loading Google Credentials from JSON string env var")
+        
+        # Debug: Print raw string representation to see hidden chars/escapes
+        logger.info(f"Raw JSON string repr: {repr(json_str)}")
+
         # Ensure proper JSON formatting (replace single quotes with double quotes)
         json_str = json_str.replace("'", '"')
         # Handle potential python-style booleans if pasted from python dict
         json_str = json_str.replace("True", "true").replace("False", "false")
         # Unescape double quotes if they were escaped (e.g. \"type\" -> "type")
         json_str = json_str.replace('\\"', '"')
+        
+        # New: Remove leading/trailing quotes if the whole JSON is quoted
+        json_str = json_str.strip().strip('"').strip("'")
+
+        logger.info(f"Cleaned JSON string repr: {repr(json_str)}")
+
         try:
             info = json.loads(json_str)
             return service_account.Credentials.from_service_account_info(info)
