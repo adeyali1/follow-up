@@ -7,8 +7,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import telnyx
 import aiohttp
 from dotenv import load_dotenv
-from backend.services import supabase_service
-from backend.bot import run_bot
+from services import supabase_service
+from bot import run_bot
 import uvicorn
 import asyncio
 import json
