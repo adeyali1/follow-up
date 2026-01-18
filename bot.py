@@ -142,7 +142,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         api_key=os.getenv("DEEPGRAM_API_KEY"),
         model="nova-2",
         language="ar",
-        sample_rate=8000
+        sample_rate=8000,
+        encoding="mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
     )
     
     # 2. Tools
