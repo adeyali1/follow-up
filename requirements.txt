@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+supabase
+pandas>=2.0.0
+numpy
+python-multipart
+python-dotenv
+pipecat-ai[deepgram,google,twilio,silero]
+onnxruntime
+telnyx
+websockets
+loguru
+openpyxl
