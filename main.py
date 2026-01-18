@@ -154,8 +154,7 @@ async def process_campaign(campaign_id: str):
                 continue
 
             # Determine the webhook URL
-            clean_domain = DOMAIN.replace("https://", "").replace("http://", "").strip("/")
-            webhook_url = f"https://{clean_domain}/api/voice/webhook?lead_id={lead['id']}"
+            webhook_url = f"https://{DOMAIN}/api/voice/webhook?lead_id={lead['id']}"
             
             # Encode Client State with Lead ID
             client_state = base64.b64encode(json.dumps({'lead_id': lead['id']}).encode()).decode()
@@ -219,41 +218,44 @@ async def webhook_route(request: Request):
             print(f"Starting audio stream to: {stream_url}")
             
             # Use Telnyx SDK (Client based)
-            try:
-                # SDK expects the raw ID
-                print(f"Using Raw ID for SDK: {call_control_id}")
-                
-                telnyx_client.calls.actions.start_streaming(
-                    call_control_id,
-                    stream_url=stream_url,
-                    stream_track="both_tracks"
-                )
-                print(f"Start streaming success (SDK) for {call_control_id}")
-            except Exception as e:
-                print(f"Failed to start streaming (SDK): {e}")
-                
-                # Fallback to aiohttp with ENCODED ID and CORRECT ENDPOINT
                 try:
-                    encoded_call_control_id = quote(call_control_id, safe='')
-                    print(f"Fallback: Using Encoded ID: {encoded_call_control_id}")
+                    # SDK expects the raw ID
+                    print(f"Using Raw ID for SDK: {call_control_id}")
                     
-                    async with aiohttp.ClientSession() as session:
-                        # Correct endpoint is streaming_start, not fork_media
-                        fork_url = f"https://api.telnyx.com/v2/calls/{encoded_call_control_id}/actions/streaming_start"
-                        headers = {
-                            "Authorization": f"Bearer {TELNYX_API_KEY}",
-                            "Content-Type": "application/json"
-                        }
-                        payload_data = {
-                            "stream_url": stream_url,
-                            "stream_track": "both_tracks"
-                        }
-                        async with session.post(fork_url, headers=headers, json=payload_data) as response:
-                             print(f"Fallback HTTP Status: {response.status}")
-                             resp_text = await response.text()
-                             print(f"Fallback HTTP Response: {resp_text}")
-                except Exception as ex:
-                    print(f"Fallback failed: {ex}")
+                    # Note: 'both_tracks' mixes audio which can cause echo for the bot (hearing itself)
+                    # We should use 'inbound_track' to hear only the user.
+                    # The bot sends audio back via the same WebSocket.
+                    
+                    # Using fallback HTTP directly as it is more reliable for specific params
+                    raise Exception("Skipping SDK to use HTTP fallback for precise control")
+
+                except Exception as e:
+                    print(f"Using HTTP fallback for streaming: {e}")
+                    
+                    # Fallback to aiohttp with ENCODED ID and CORRECT ENDPOINT
+                    try:
+                        encoded_call_control_id = quote(call_control_id, safe='')
+                        print(f"Fallback: Using Encoded ID: {encoded_call_control_id}")
+                        
+                        async with aiohttp.ClientSession() as session:
+                            # Correct endpoint is streaming_start, not fork_media
+                            fork_url = f"https://api.telnyx.com/v2/calls/{encoded_call_control_id}/actions/streaming_start"
+                            headers = {
+                                "Authorization": f"Bearer {TELNYX_API_KEY}",
+                                "Content-Type": "application/json"
+                            }
+                            payload_data = {
+                                "stream_url": stream_url,
+                                "stream_track": "inbound_track", # Changed from both_tracks to inbound_track
+                                "enable_dialogflow": False, # Ensure this is off
+                                "stream_bidirectional_codec": "PCMU" # Force PCMU codec for the stream
+                            }
+                            async with session.post(fork_url, headers=headers, json=payload_data) as response:
+                                 print(f"Fallback HTTP Status: {response.status}")
+                                 resp_text = await response.text()
+                                 print(f"Fallback HTTP Response: {resp_text}")
+                    except Exception as ex:
+                        print(f"Fallback failed: {ex}")
             
         elif event_type == 'call.hangup':
             print(f"Call ended for lead {lead_id}")
