@@ -44,8 +44,7 @@ def get_google_credentials():
             info = json.loads(json_str)
             if "private_key" in info:
                 info["private_key"] = info["private_key"].replace("\\n", "\n")
-            # Pipecat's GoogleVertexLLMService expects a JSON string, not a Credentials object
-            return json.dumps(info)
+            return info
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse Google Credentials JSON: {e}")
             logger.error(f"First 100 chars of JSON: {json_str[:100]}")
@@ -65,8 +64,18 @@ def get_google_credentials():
 async def run_bot(websocket_client, lead_data, call_control_id=None):
     logger.info(f"Starting bot for lead: {lead_data['id']}")
     
-    # Get Credentials Object (if using JSON string)
-    google_creds = get_google_credentials()
+    # Get Credentials (dictionary)
+    google_creds_dict = get_google_credentials()
+    
+    # Prepare Credentials for different services
+    google_creds_str = None
+    google_creds_obj = None
+
+    if google_creds_dict:
+        # LLM needs JSON string
+        google_creds_str = json.dumps(google_creds_dict)
+        # TTS likely needs Credentials object
+        google_creds_obj = service_account.Credentials.from_service_account_info(google_creds_dict)
     
     # 1. Services
     vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=0.4, confidence=0.5))
@@ -114,8 +123,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         "tools": tools
     }
     
-    if google_creds:
-        llm_kwargs["credentials"] = google_creds
+    if google_creds_str:
+        llm_kwargs["credentials"] = google_creds_str
     else:
         llm_kwargs["credentials_path"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
@@ -125,8 +134,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     tts_kwargs = {
         "voice_id": "ar-JO-Standard-A"
     }
-    if google_creds:
-        tts_kwargs["credentials"] = google_creds
+    if google_creds_obj:
+        tts_kwargs["credentials"] = google_creds_obj
     else:
         tts_kwargs["credentials_path"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
