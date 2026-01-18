@@ -7,7 +7,7 @@ from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator, LLMAssistantAggregator
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.frames.frames import LLMContextFrame, EndFrame
-from pipecat.services.deepgram import DeepgramSTTService
+from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.google.llm_vertex import GoogleVertexLLMService
 from pipecat.services.google.tts import GoogleTTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
