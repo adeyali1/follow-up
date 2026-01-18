@@ -156,11 +156,15 @@ async def process_campaign(campaign_id: str):
             # Determine the webhook URL
             webhook_url = f"https://{DOMAIN}/api/voice/webhook?lead_id={lead['id']}"
             
+            # Encode Client State with Lead ID
+            client_state = base64.b64encode(json.dumps({'lead_id': lead['id']}).encode()).decode()
+
             call = telnyx_client.calls.dial(
                 to=lead['phone_number'],
                 from_=TELNYX_PHONE_NUMBER,
                 connection_id=TELNYX_CONNECTION_ID,
-                webhook_url=webhook_url
+                webhook_url=webhook_url,
+                client_state=client_state
             )
             # Handle response object safely
             call_control_id = getattr(call, 'call_control_id', None)
@@ -208,7 +212,9 @@ async def webhook_route(request: Request):
 
         if event_type == 'call.answered':
             # Fork Audio to WebSocket
-            stream_url = f"wss://{DOMAIN}/media-stream?lead_id={lead_id}&call_control_id={call_control_id}"
+            # Clean domain to avoid double slashes
+            clean_domain = DOMAIN.replace("https://", "").replace("http://", "").strip("/")
+            stream_url = f"wss://{clean_domain}/media-stream?lead_id={lead_id}&call_control_id={call_control_id}"
             print(f"Starting audio stream to: {stream_url}")
             
             # Use Telnyx SDK (Client based)
