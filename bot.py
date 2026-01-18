@@ -28,6 +28,13 @@ def get_google_credentials():
         
         # Basic cleanup of wrapping quotes
         json_str = json_str.strip().strip("'").strip('"')
+        
+        # Handle escaped quotes commonly found in env vars (e.g. \"type\" -> "type")
+        # This is necessary because the logs show the input has literal backslash-quote sequences
+        json_str = json_str.replace('\\"', '"')
+        
+        # Handle boolean values if they are Python-style
+        json_str = json_str.replace("True", "true").replace("False", "false")
 
         try:
             # Try parsing as standard JSON
@@ -67,19 +74,35 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     # 0. Handle Telnyx Handshake to get stream_id
     stream_id = "telnyx_stream_placeholder"
     try:
-        # Telnyx typically sends a JSON payload first with event="connected" or "start"
-        # We need to capture the stream_id from this to send audio back correctly.
-        msg_text = await websocket_client.receive_text()
-        logger.info(f"Received initial Telnyx message: {msg_text}")
-        msg = json.loads(msg_text)
+        # Telnyx typically sends a JSON payload first with event="connected"
+        # Then it sends event="start" which contains the stream_id
+        # We need to loop until we find the stream_id or a reasonable timeout/limit
         
-        # Check standard locations for stream_id
-        if "stream_id" in msg:
-            stream_id = msg["stream_id"]
-        elif "data" in msg and "stream_id" in msg["data"]:
-            stream_id = msg["data"]["stream_id"]
+        logger.info("Waiting for Telnyx 'start' event with stream_id...")
+        
+        for _ in range(3): # Try up to 3 messages
+            msg_text = await websocket_client.receive_text()
+            logger.info(f"Received Telnyx message: {msg_text}")
+            msg = json.loads(msg_text)
             
-        logger.info(f"Captured stream_id: {stream_id}")
+            # Check standard locations for stream_id
+            if "stream_id" in msg:
+                stream_id = msg["stream_id"]
+                logger.info(f"Captured stream_id (direct): {stream_id}")
+                break
+            elif "data" in msg and "stream_id" in msg["data"]:
+                stream_id = msg["data"]["stream_id"]
+                logger.info(f"Captured stream_id (in data): {stream_id}")
+                break
+            elif msg.get("event") == "start":
+                 # sometimes start event has it
+                 pass
+            
+            # If we didn't find it, we loop again to get the next message
+            
+        if stream_id == "telnyx_stream_placeholder":
+             logger.warning("Could not find stream_id in initial messages, using placeholder.")
+             
     except Exception as e:
         logger.error(f"Failed to capture stream_id from initial message: {e}")
 
