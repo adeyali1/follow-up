@@ -1,0 +1,34 @@
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.db
+.DS_Store
+
+# Secrets
+backend/google_key.json
+
+# IDEs
+.idea/
+.vscode/
+.trae/
+
+# Node
+node_modules/
+.next/
+dist/
+build/
+ 
+# Archives
+*.zip
+
+# Nested repos
+dollanyapp-project/
