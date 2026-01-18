@@ -28,6 +28,8 @@ def get_google_credentials():
         json_str = json_str.replace("'", '"')
         # Handle potential python-style booleans if pasted from python dict
         json_str = json_str.replace("True", "true").replace("False", "false")
+        # Unescape double quotes if they were escaped (e.g. \"type\" -> "type")
+        json_str = json_str.replace('\\"', '"')
         try:
             info = json.loads(json_str)
             return service_account.Credentials.from_service_account_info(info)
