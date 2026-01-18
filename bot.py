@@ -42,6 +42,12 @@ def get_google_credentials():
 
         try:
             info = json.loads(json_str)
+            
+            # Clean string values (remove accidental backticks or whitespace)
+            for key, value in info.items():
+                if isinstance(value, str):
+                    info[key] = value.replace("`", "").strip()
+
             if "private_key" in info:
                 info["private_key"] = info["private_key"].replace("\\n", "\n")
             return info
