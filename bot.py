@@ -44,7 +44,8 @@ def get_google_credentials():
             info = json.loads(json_str)
             if "private_key" in info:
                 info["private_key"] = info["private_key"].replace("\\n", "\n")
-            return service_account.Credentials.from_service_account_info(info)
+            # Pipecat's GoogleVertexLLMService expects a JSON string, not a Credentials object
+            return json.dumps(info)
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse Google Credentials JSON: {e}")
             logger.error(f"First 100 chars of JSON: {json_str[:100]}")
