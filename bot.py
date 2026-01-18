@@ -1,15 +1,13 @@
 import os
 import sys
-import json
+import ast
 from loguru import logger
-from google.oauth2 import service_account
-
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator, LLMAssistantAggregator
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.frames.frames import LLMContextFrame
+from pipecat.frames.frames import LLMContextFrame, EndFrame
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.google.llm_vertex import GoogleVertexLLMService
 from pipecat.services.google.tts import GoogleTTSService
@@ -19,70 +17,109 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from services.supabase_service import update_lead_status
 
-# Helper function to get Google Credentials safely
+import json
+from google.oauth2 import service_account
+
+# Helper function to get Google Credentials
 def get_google_credentials():
     json_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if not json_str:
-        logger.error("GOOGLE_APPLICATION_CREDENTIALS_JSON not found in environment")
-        return None
+    if json_str:
+        logger.info("Loading Google Credentials from JSON string env var")
+        
+        # Basic cleanup of wrapping quotes
+        json_str = json_str.strip().strip("'").strip('"')
+        
+        # Handle escaped quotes commonly found in env vars (e.g. \"type\" -> "type")
+        # This is necessary because the logs show the input has literal backslash-quote sequences
+        json_str = json_str.replace('\\"', '"')
+        
+        # Handle boolean values if they are Python-style
+        json_str = json_str.replace("True", "true").replace("False", "false")
 
-    try:
-        # 1. Basic cleaning: remove accidental backticks or wrapping quotes
-        json_str = json_str.strip().strip('`').strip('"').strip("'")
+        try:
+            # Try parsing as standard JSON
+            info = json.loads(json_str)
+            logger.info("Successfully parsed credentials as JSON")
+        except json.JSONDecodeError:
+            # Fallback: Try parsing as a Python dictionary string (handles single quotes safely)
+            try:
+                logger.info("JSON decode failed, trying ast.literal_eval")
+                info = ast.literal_eval(json_str)
+            except (ValueError, SyntaxError) as e:
+                logger.error(f"Failed to parse Google Credentials: {e}")
+                logger.error(f"First 100 chars: {json_str[:100]}")
+                return None
         
-        # 2. Fix double escaping of backslashes (common in Docker/Coolify)
-        # This turns \\n into \n before json loading
-        json_str = json_str.replace("\\\\n", "\\n")
-        
-        # 3. Load the JSON
-        info = json.loads(json_str)
-        
-        # 4. Final fix for the private key specifically
+        # Post-processing: Handle private key newlines if needed
         if "private_key" in info:
-            # Ensure the private key has actual newline characters
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
-            
+             # Ensure we have actual newlines, not escaped ones
+             info["private_key"] = info["private_key"].replace("\\n", "\n")
+             
         return info
-    except Exception as e:
-        logger.error(f"Failed to parse Google Credentials JSON: {e}")
-        return None
+    
+    # Fallback to file path
+    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if path and os.path.exists(path):
+        logger.info(f"Loading Google Credentials from file: {path}")
+        # We return None here because the service classes (GoogleVertexLLMService) 
+        # usually take a path OR credentials object, but let's see what pipecat expects.
+        # Actually, pipecat's GoogleVertexLLMService takes `credentials_path` OR `credentials`.
+        # We will adjust the instantiation below.
+        return None 
+    return None
 
 async def run_bot(websocket_client, lead_data, call_control_id=None):
-    logger.info(f"Starting bot initialization for lead: {lead_data['id']}")
-    
-    # --- 1. TELNYX HANDSHAKE (CRITICAL) ---
-    # We must wait for the first message to get the real stream_id
-    stream_id = None
-    try:
-        # Telnyx sends a 'connected' or 'start' message immediately
-        first_msg = await websocket_client.receive_json()
-        logger.debug(f"Received initial Telnyx message: {first_msg}")
-        
-        if first_msg.get("event") in ["connected", "start"]:
-            # Extract stream_id from the nested 'start' object or top level
-            stream_id = first_msg.get("stream_id") or first_msg.get("start", {}).get("stream_id")
-            
-        if not stream_id:
-            logger.warning("Could not find stream_id in first message, using placeholder")
-            stream_id = "telnyx_stream_placeholder"
-        else:
-            logger.info(f"Using Telnyx stream_id: {stream_id}")
-    except Exception as e:
-        logger.error(f"Error during Telnyx handshake: {e}")
-        stream_id = "telnyx_stream_placeholder"
+    logger.info(f"Starting bot for lead: {lead_data['id']}")
 
-    # --- 2. CREDENTIALS SETUP ---
+    # 0. Handle Telnyx Handshake to get stream_id
+    stream_id = "telnyx_stream_placeholder"
+    try:
+        # Telnyx typically sends a JSON payload first with event="connected"
+        # Then it sends event="start" which contains the stream_id
+        # We need to loop until we find the stream_id or a reasonable timeout/limit
+        
+        logger.info("Waiting for Telnyx 'start' event with stream_id...")
+        
+        for _ in range(3): # Try up to 3 messages
+            msg_text = await websocket_client.receive_text()
+            logger.info(f"Received Telnyx message: {msg_text}")
+            msg = json.loads(msg_text)
+            
+            # Check standard locations for stream_id
+            if "stream_id" in msg:
+                stream_id = msg["stream_id"]
+                logger.info(f"Captured stream_id (direct): {stream_id}")
+                break
+            elif "data" in msg and "stream_id" in msg["data"]:
+                stream_id = msg["data"]["stream_id"]
+                logger.info(f"Captured stream_id (in data): {stream_id}")
+                break
+            elif msg.get("event") == "start":
+                 # sometimes start event has it
+                 pass
+            
+            # If we didn't find it, we loop again to get the next message
+            
+        if stream_id == "telnyx_stream_placeholder":
+             logger.warning("Could not find stream_id in initial messages, using placeholder.")
+             
+    except Exception as e:
+        logger.error(f"Failed to capture stream_id from initial message: {e}")
+
+    # Get Credentials (dictionary)
     google_creds_dict = get_google_credentials()
+    
+    # Prepare Credentials for different services
+    google_creds_str = None
     google_creds_obj = None
 
     if google_creds_dict:
-        try:
-            google_creds_obj = service_account.Credentials.from_service_account_info(google_creds_dict)
-            logger.info("Google Service Account credentials initialized successfully")
-        except Exception as e:
-            logger.error(f"Error creating Service Account object: {e}")
-
-    # --- 3. SERVICES SETUP ---
+        # LLM needs JSON string
+        google_creds_str = json.dumps(google_creds_dict)
+        # TTS likely needs Credentials object
+        google_creds_obj = service_account.Credentials.from_service_account_info(google_creds_dict)
+    
+    # 1. Services
     vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=0.4, confidence=0.5))
     
     stt = DeepgramSTTService(
@@ -91,8 +128,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         language="ar",
         sample_rate=8000
     )
-
-    # Tool definitions
+    
+    # 2. Tools
     tools = [
         {
             "function_declarations": [
@@ -101,7 +138,9 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                     "description": "Call this when the customer confirms the order.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"reason": {"type": "string"}},
+                        "properties": {
+                            "reason": {"type": "string", "description": "Reason for confirmation"}
+                        },
                     },
                 },
                 {
@@ -109,50 +148,80 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                     "description": "Call this when the customer cancels the order.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"reason": {"type": "string"}},
+                        "properties": {
+                            "reason": {"type": "string", "description": "Reason for cancellation"}
+                        },
                     },
                 },
             ]
         }
     ]
 
-    # LLM Service (Vertex AI)
-    llm = GoogleVertexLLMService(
-        project_id=os.getenv("GOOGLE_PROJECT_ID") or google_creds_dict.get("project_id"),
-        location="us-central1",
-        model="gemini-1.5-flash-001",
-        tools=tools,
-        credentials=google_creds_dict  # Pipecat takes the dict here
-    )
+    # Initialize LLM with either path or credentials object
+    llm_kwargs = {
+        "project_id": os.getenv("GOOGLE_PROJECT_ID"),
+        "location": "us-central1",
+        "model": "gemini-1.5-flash-001",
+        "tools": tools
+    }
     
-    # TTS Service
-    tts = GoogleTTSService(
-        voice_id="ar-JO-Standard-A",
-        credentials=google_creds_obj  # Pipecat takes the credentials object here
-    )
+    if google_creds_str:
+        llm_kwargs["credentials"] = google_creds_str
+    else:
+        llm_kwargs["credentials_path"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
-    # Register functions
+    llm = GoogleVertexLLMService(**llm_kwargs)
+    
+    # Initialize TTS
+    tts_kwargs = {
+        "voice_id": "ar-JO-Standard-A"
+    }
+    if google_creds_obj:
+        tts_kwargs["credentials"] = google_creds_obj
+    else:
+        tts_kwargs["credentials_path"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+    tts = GoogleTTSService(**tts_kwargs)
+
+    # 3. Handlers
     async def confirm_order(function_name, tool_call_id, args, llm, context, result_callback):
-        logger.info(f"Tool Call: Confirming order for lead {lead_data['id']}")
+        logger.info(f"Confirming order for lead {lead_data['id']}")
         update_lead_status(lead_data['id'], 'CONFIRMED')
-        await result_callback("تم تأكيد الطلب بنجاح")
+        await result_callback("Order confirmed successfully.")
 
     async def cancel_order(function_name, tool_call_id, args, llm, context, result_callback):
-        logger.info(f"Tool Call: Cancelling order for lead {lead_data['id']}")
+        logger.info(f"Cancelling order for lead {lead_data['id']}")
         update_lead_status(lead_data['id'], 'CANCELLED')
-        await result_callback("تم إلغاء الطلب")
+        await result_callback("Order cancelled.")
 
-    llm.register_function("update_lead_status_confirmed", confirm_order)
-    llm.register_function("update_lead_status_cancelled", cancel_order)
+    llm.register_function(
+        "update_lead_status_confirmed",
+        confirm_order
+    )
+    llm.register_function(
+        "update_lead_status_cancelled",
+        cancel_order
+    )
 
-    # --- 4. TRANSPORT & PIPELINE ---
+    # 3. Transport (Telnyx)
+    # Note: TelnyxFrameSerializer requires stream_id and call_control_id for full functionality (like hanging up)
+    # In a basic setup, we might not have them immediately from the websocket handshake in the same way.
+    # We will instantiate it with placeholders or extract if possible.
+    # For now, we'll use a dummy stream_id if we don't have one, or rely on what Pipecat needs.
+    
+    # We need to know the call_control_id to hang up. 
+    # If we can't get it from the websocket, we might need to pass it from the webhook handler -> main.py -> run_bot
+    # But for now, let's assume we just want audio streaming working.
+    
     serializer = TelnyxFrameSerializer(
-        stream_id=stream_id,
+        stream_id=stream_id, # Captured from handshake
         call_control_id=call_control_id,
         api_key=os.getenv("TELNYX_API_KEY"),
-        outbound_encoding="PCMU",
+        outbound_encoding="PCMU", # Telnyx default
         inbound_encoding="PCMU",
-        params=TelnyxFrameSerializer.InputParams(sample_rate=8000)
+        params=TelnyxFrameSerializer.InputParams(
+            sample_rate=8000
+        )
     )
     
     transport = FastAPIWebsocketTransport(
@@ -170,19 +239,22 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         )
     )
 
+    # 4. Prompt
     system_prompt = f"""You are Kawkab AI, a delivery assistant. Speak in Jordanian Arabic.
 Greet {lead_data['customer_name']}. Confirm they ordered {lead_data['order_items']} for delivery at {lead_data['delivery_time']}.
 If confirmed, call tool update_lead_status_confirmed().
 If cancelled, call tool update_lead_status_cancelled().
+If no answer or voicemail, just hang up (I will handle this via timeout or silence).
 """
 
     context = LLMContext(
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "ابدأ المحادثة الآن ورحب بالعميل"}
+            {"role": "user", "content": "Greet the customer now."}
         ]
     )
 
+    # 5. Pipeline
     user_agg = LLMUserAggregator(context)
     assistant_agg = LLMAssistantAggregator(context)
 
@@ -197,9 +269,9 @@ If cancelled, call tool update_lead_status_cancelled().
     ])
 
     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+    
     runner = PipelineRunner()
     
     await task.queue_frames([LLMContextFrame(context)])
     
-    logger.info("Bot Pipeline running...")
     await runner.run(task)
