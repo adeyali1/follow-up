@@ -16,8 +16,33 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from backend.services.supabase_service import update_lead_status
 
+import json
+from google.oauth2 import service_account
+
+# Helper function to get Google Credentials
+def get_google_credentials():
+    json_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if json_str:
+        logger.info("Loading Google Credentials from JSON string env var")
+        info = json.loads(json_str)
+        return service_account.Credentials.from_service_account_info(info)
+    
+    # Fallback to file path
+    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if path and os.path.exists(path):
+        logger.info(f"Loading Google Credentials from file: {path}")
+        # We return None here because the service classes (GoogleVertexLLMService) 
+        # usually take a path OR credentials object, but let's see what pipecat expects.
+        # Actually, pipecat's GoogleVertexLLMService takes `credentials_path` OR `credentials`.
+        # We will adjust the instantiation below.
+        return None 
+    return None
+
 async def run_bot(websocket_client, lead_data, call_control_id=None):
     logger.info(f"Starting bot for lead: {lead_data['id']}")
+    
+    # Get Credentials Object (if using JSON string)
+    google_creds = get_google_credentials()
     
     # 1. Services
     vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=0.4, confidence=0.5))
@@ -57,18 +82,31 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         }
     ]
 
-    llm = GoogleVertexLLMService(
-        credentials_path=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-        project_id=os.getenv("GOOGLE_PROJECT_ID"),
-        location="us-central1",
-        model="gemini-1.5-flash-001",
-        tools=tools
-    )
+    # Initialize LLM with either path or credentials object
+    llm_kwargs = {
+        "project_id": os.getenv("GOOGLE_PROJECT_ID"),
+        "location": "us-central1",
+        "model": "gemini-1.5-flash-001",
+        "tools": tools
+    }
     
-    tts = GoogleTTSService(
-        credentials_path=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-        voice_id="ar-JO-Standard-A" # Jordanian Arabic
-    )
+    if google_creds:
+        llm_kwargs["credentials"] = google_creds
+    else:
+        llm_kwargs["credentials_path"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+    llm = GoogleVertexLLMService(**llm_kwargs)
+    
+    # Initialize TTS
+    tts_kwargs = {
+        "voice_id": "ar-JO-Standard-A"
+    }
+    if google_creds:
+        tts_kwargs["credentials"] = google_creds
+    else:
+        tts_kwargs["credentials_path"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+    tts = GoogleTTSService(**tts_kwargs)
 
     # 3. Handlers
     async def confirm_order(function_name, tool_call_id, args, llm, context, result_callback):
