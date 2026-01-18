@@ -37,7 +37,6 @@ def get_google_credentials():
         json_str = json_str.strip().strip("'").strip('"')
         
         # Handle escaped quotes commonly found in env vars (e.g. \"type\" -> "type")
-        # This is necessary because the logs show the input has literal backslash-quote sequences
         json_str = json_str.replace('\\"', '"')
         
         # Handle boolean values if they are Python-style
@@ -48,7 +47,7 @@ def get_google_credentials():
             info = json.loads(json_str)
             logger.info("Successfully parsed credentials as JSON")
         except json.JSONDecodeError:
-            # Fallback: Try parsing as a Python dictionary string (handles single quotes safely)
+            # Fallback: Try parsing as a Python dictionary string
             try:
                 logger.info("JSON decode failed, trying ast.literal_eval")
                 info = ast.literal_eval(json_str)
@@ -59,10 +58,10 @@ def get_google_credentials():
         
         # Post-processing: Handle private key newlines if needed
         if "private_key" in info:
-              # Ensure we have actual newlines, not escaped ones
-              info["private_key"] = info["private_key"].replace("\\n", "\n")
-              
-         return info
+            # Ensure we have actual newlines, not escaped ones
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+            
+        return info
     
     return None
 
