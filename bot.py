@@ -70,6 +70,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     # 0. Handle Telnyx Handshake to get stream_id
     stream_id = "telnyx_stream_placeholder"
+    inbound_encoding = "PCMU" # Default to PCMU (G.711u)
     try:
         # Telnyx typically sends a JSON payload first with event="connected"
         # Then it sends event="start" which contains the stream_id
@@ -92,8 +93,26 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 logger.info(f"Captured stream_id (in data): {stream_id}")
                 break
             elif msg.get("event") == "start":
-                 # sometimes start event has it
-                 pass
+                 if "media_format" in msg:
+                     encoding = msg["media_format"].get("encoding", "").upper()
+                     logger.info(f"Telnyx Media Format: {msg['media_format']}")
+                     
+                     if encoding == "G729":
+                         logger.error("CRITICAL: Telnyx is sending G.729 audio. Pipecat requires PCMU (G.711u) or PCMA (G.711a).")
+                         logger.error("Please disable G.729 in your Telnyx Portal SIP Connection settings.")
+                     elif encoding == "PCMA":
+                         logger.info("Detected PCMA encoding, updating serializer.")
+                         inbound_encoding = "PCMA"
+                     elif encoding == "PCMU":
+                         inbound_encoding = "PCMU"
+                     else:
+                         logger.warning(f"Unknown encoding: {encoding}, defaulting to PCMU.")
+                 
+                 # capture stream_id if present
+                 if "stream_id" in msg:
+                      stream_id = msg["stream_id"]
+                      logger.info(f"Captured stream_id (from start event): {stream_id}")
+                      break
             
             # If we didn't find it, we loop again to get the next message
             
@@ -215,7 +234,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         call_control_id=call_control_id,
         api_key=os.getenv("TELNYX_API_KEY"),
         outbound_encoding="PCMU", # Telnyx default
-        inbound_encoding="PCMU",
+        inbound_encoding=inbound_encoding, # Use detected encoding
         params=TelnyxFrameSerializer.InputParams(
             sample_rate=8000
         )
