@@ -244,7 +244,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         stream_id=stream_id, # Captured from handshake
         call_control_id=call_control_id,
         api_key=os.getenv("TELNYX_API_KEY"),
-        outbound_encoding="PCMU", # Telnyx default
+        outbound_encoding=inbound_encoding, # Sync with detected encoding
         inbound_encoding=inbound_encoding, # Use detected encoding
         params=TelnyxFrameSerializer.InputParams(
             sample_rate=8000
@@ -274,17 +274,13 @@ If cancelled, call tool update_lead_status_cancelled().
 If no answer or voicemail, just hang up (I will handle this via timeout or silence).
 """
 
-    context = LLMContext(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            # {"role": "user", "content": "Greet the customer now."} # Pipecat usually doesn't need this to start if we inject ContextFrame
-        ]
-    )
-    
-    # Pre-inject a system message to kickstart the conversation if needed, 
-    # but for LLMUserAggregator, it waits for USER input.
-    # To make the bot speak FIRST, we need to manually queue the initial greeting or prompt the LLM to start.
-    
+    # 4. Prompt & Context
+    # Single context with system prompt AND initial user trigger
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Start the conversation by greeting the customer."}
+    ]
+    context = LLMContext(messages=messages)
     context_frame = LLMContextFrame(context)
 
     # 5. Pipeline
@@ -305,21 +301,7 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     
     runner = PipelineRunner()
     
-    # Queue the context so the LLM knows who it is
+    # Queue single initial frame
     await task.queue_frames([context_frame])
-    
-    # IMPORTANT: To make the bot speak FIRST (before user speaks), we need to trigger the LLM.
-    # We can do this by queuing a user message saying "Start conversation" invisible to the user,
-    # or by just queueing the initial context and relying on the LLM to pick it up if configured.
-    # For Vertex AI/Gemini, it often waits for user input.
-    # Let's force an initial generation.
-    
-    # We create a fake user trigger to make the bot say hello immediately
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "Start the conversation by greeting the customer."} 
-    ]
-    initial_context = LLMContext(messages=messages)
-    await task.queue_frames([LLMContextFrame(initial_context)])
 
     await runner.run(task)
