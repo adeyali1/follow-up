@@ -42,6 +42,8 @@ def get_google_credentials():
 
         try:
             info = json.loads(json_str)
+            if "private_key" in info:
+                info["private_key"] = info["private_key"].replace("\\n", "\n")
             return service_account.Credentials.from_service_account_info(info)
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse Google Credentials JSON: {e}")
