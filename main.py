@@ -154,7 +154,8 @@ async def process_campaign(campaign_id: str):
                 continue
 
             # Determine the webhook URL
-            webhook_url = f"https://{DOMAIN}/api/voice/webhook?lead_id={lead['id']}"
+            clean_domain = DOMAIN.replace("https://", "").replace("http://", "").strip("/")
+            webhook_url = f"https://{clean_domain}/api/voice/webhook?lead_id={lead['id']}"
             
             # Encode Client State with Lead ID
             client_state = base64.b64encode(json.dumps({'lead_id': lead['id']}).encode()).decode()
