@@ -248,6 +248,7 @@ async def webhook_route(request: Request):
                             "stream_url": stream_url,
                             "stream_track": "inbound_track", # Changed from both_tracks to inbound_track
                             "enable_dialogflow": False, # Ensure this is off
+                            "stream_bidirectional_mode": "rtp",
                             "stream_bidirectional_codec": "PCMU" # Force PCMU codec for the stream
                         }
                         async with session.post(fork_url, headers=headers, json=payload_data) as response:
