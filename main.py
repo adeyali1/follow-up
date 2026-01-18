@@ -164,7 +164,8 @@ async def process_campaign(campaign_id: str):
                 from_=TELNYX_PHONE_NUMBER,
                 connection_id=TELNYX_CONNECTION_ID,
                 webhook_url=webhook_url,
-                client_state=client_state
+                client_state=client_state,
+                preferred_codecs="PCMU"
             )
             # Handle response object safely
             call_control_id = getattr(call, 'call_control_id', None)
