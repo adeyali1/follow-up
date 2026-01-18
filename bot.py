@@ -83,6 +83,31 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             logger.info(f"Received Telnyx message: {msg_text}")
             msg = json.loads(msg_text)
             
+            # Check if this message has media_format information (usually in 'start' event)
+            if "media_format" in msg:
+                 encoding = msg["media_format"].get("encoding", "").upper()
+                 logger.info(f"Telnyx Media Format (direct): {msg['media_format']}")
+                 if encoding == "G729":
+                     logger.error("CRITICAL: Telnyx is sending G.729 audio. Pipecat requires PCMU (G.711u) or PCMA (G.711a).")
+                     logger.error("Please disable G.729 in your Telnyx Portal SIP Connection settings.")
+                 elif encoding == "PCMA":
+                     logger.info("Detected PCMA encoding, updating serializer.")
+                     inbound_encoding = "PCMA"
+                 elif encoding == "PCMU":
+                     inbound_encoding = "PCMU"
+
+            elif "start" in msg and "media_format" in msg["start"]:
+                 encoding = msg["start"]["media_format"].get("encoding", "").upper()
+                 logger.info(f"Telnyx Media Format (nested in start): {msg['start']['media_format']}")
+                 if encoding == "G729":
+                     logger.error("CRITICAL: Telnyx is sending G.729 audio. Pipecat requires PCMU (G.711u) or PCMA (G.711a).")
+                     logger.error("Please disable G.729 in your Telnyx Portal SIP Connection settings.")
+                 elif encoding == "PCMA":
+                     logger.info("Detected PCMA encoding, updating serializer.")
+                     inbound_encoding = "PCMA"
+                 elif encoding == "PCMU":
+                     inbound_encoding = "PCMU"
+
             # Check standard locations for stream_id
             if "stream_id" in msg:
                 stream_id = msg["stream_id"]
@@ -93,21 +118,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 logger.info(f"Captured stream_id (in data): {stream_id}")
                 break
             elif msg.get("event") == "start":
-                 if "media_format" in msg:
-                     encoding = msg["media_format"].get("encoding", "").upper()
-                     logger.info(f"Telnyx Media Format: {msg['media_format']}")
-                     
-                     if encoding == "G729":
-                         logger.error("CRITICAL: Telnyx is sending G.729 audio. Pipecat requires PCMU (G.711u) or PCMA (G.711a).")
-                         logger.error("Please disable G.729 in your Telnyx Portal SIP Connection settings.")
-                     elif encoding == "PCMA":
-                         logger.info("Detected PCMA encoding, updating serializer.")
-                         inbound_encoding = "PCMA"
-                     elif encoding == "PCMU":
-                         inbound_encoding = "PCMU"
-                     else:
-                         logger.warning(f"Unknown encoding: {encoding}, defaulting to PCMU.")
-                 
                  # capture stream_id if present
                  if "stream_id" in msg:
                       stream_id = msg["stream_id"]
@@ -267,9 +277,15 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     context = LLMContext(
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "Greet the customer now."}
+            # {"role": "user", "content": "Greet the customer now."} # Pipecat usually doesn't need this to start if we inject ContextFrame
         ]
     )
+    
+    # Pre-inject a system message to kickstart the conversation if needed, 
+    # but for LLMUserAggregator, it waits for USER input.
+    # To make the bot speak FIRST, we need to manually queue the initial greeting or prompt the LLM to start.
+    
+    context_frame = LLMContextFrame(context)
 
     # 5. Pipeline
     user_agg = LLMUserAggregator(context)
@@ -289,6 +305,21 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     
     runner = PipelineRunner()
     
-    await task.queue_frames([LLMContextFrame(context)])
+    # Queue the context so the LLM knows who it is
+    await task.queue_frames([context_frame])
     
+    # IMPORTANT: To make the bot speak FIRST (before user speaks), we need to trigger the LLM.
+    # We can do this by queuing a user message saying "Start conversation" invisible to the user,
+    # or by just queueing the initial context and relying on the LLM to pick it up if configured.
+    # For Vertex AI/Gemini, it often waits for user input.
+    # Let's force an initial generation.
+    
+    # We create a fake user trigger to make the bot say hello immediately
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Start the conversation by greeting the customer."} 
+    ]
+    initial_context = LLMContext(messages=messages)
+    await task.queue_frames([LLMContextFrame(initial_context)])
+
     await runner.run(task)
