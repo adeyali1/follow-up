@@ -26,8 +26,15 @@ def get_google_credentials():
         logger.info("Loading Google Credentials from JSON string env var")
         # Ensure proper JSON formatting (replace single quotes with double quotes)
         json_str = json_str.replace("'", '"')
-        info = json.loads(json_str)
-        return service_account.Credentials.from_service_account_info(info)
+        # Handle potential python-style booleans if pasted from python dict
+        json_str = json_str.replace("True", "true").replace("False", "false")
+        try:
+            info = json.loads(json_str)
+            return service_account.Credentials.from_service_account_info(info)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Google Credentials JSON: {e}")
+            logger.error(f"First 100 chars of JSON: {json_str[:100]}")
+            return None
     
     # Fallback to file path
     path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
