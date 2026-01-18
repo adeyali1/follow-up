@@ -22,6 +22,13 @@ from google.oauth2 import service_account
 
 # Helper function to get Google Credentials
 def get_google_credentials():
+    # 1. Try File Path First (Preferred)
+    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if path and os.path.exists(path):
+        logger.info(f"Found Google Credentials file at: {path}")
+        return None # Return None so run_bot uses the path directly
+
+    # 2. Try JSON String (Fallback)
     json_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if json_str:
         logger.info("Loading Google Credentials from JSON string env var")
@@ -52,20 +59,11 @@ def get_google_credentials():
         
         # Post-processing: Handle private key newlines if needed
         if "private_key" in info:
-             # Ensure we have actual newlines, not escaped ones
-             info["private_key"] = info["private_key"].replace("\\n", "\n")
-             
-        return info
+              # Ensure we have actual newlines, not escaped ones
+              info["private_key"] = info["private_key"].replace("\\n", "\n")
+              
+         return info
     
-    # Fallback to file path
-    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if path and os.path.exists(path):
-        logger.info(f"Loading Google Credentials from file: {path}")
-        # We return None here because the service classes (GoogleVertexLLMService) 
-        # usually take a path OR credentials object, but let's see what pipecat expects.
-        # Actually, pipecat's GoogleVertexLLMService takes `credentials_path` OR `credentials`.
-        # We will adjust the instantiation below.
-        return None 
     return None
 
 async def run_bot(websocket_client, lead_data, call_control_id=None):
