@@ -168,28 +168,26 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     # 2. Tools
     tools = [
         {
-            "function_declarations": [
-                {
-                    "name": "update_lead_status_confirmed",
-                    "description": "Call this when the customer confirms the order.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "reason": {"type": "string", "description": "Reason for confirmation"}
-                        },
-                    },
+            "name": "update_lead_status_confirmed",
+            "description": "Call this when the customer confirms the order.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Reason for confirmation"}
                 },
-                {
-                    "name": "update_lead_status_cancelled",
-                    "description": "Call this when the customer cancels the order.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "reason": {"type": "string", "description": "Reason for cancellation"}
-                        },
-                    },
+                "required": ["reason"]
+            },
+        },
+        {
+            "name": "update_lead_status_cancelled",
+            "description": "Call this when the customer cancels the order.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Reason for cancellation"}
                 },
-            ]
+                "required": ["reason"]
+            },
         }
     ]
 
@@ -220,15 +218,15 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     tts = GoogleTTSService(**tts_kwargs)
 
     # 3. Handlers
-    async def confirm_order(function_name, tool_call_id, args, llm, context, result_callback):
+    async def confirm_order(params):
         logger.info(f"Confirming order for lead {lead_data['id']}")
         update_lead_status(lead_data['id'], 'CONFIRMED')
-        await result_callback("Order confirmed successfully.")
+        await params.result_callback("Order confirmed successfully.")
 
-    async def cancel_order(function_name, tool_call_id, args, llm, context, result_callback):
+    async def cancel_order(params):
         logger.info(f"Cancelling order for lead {lead_data['id']}")
         update_lead_status(lead_data['id'], 'CANCELLED')
-        await result_callback("Order cancelled.")
+        await params.result_callback("Order cancelled.")
 
     llm.register_function(
         "update_lead_status_confirmed",
