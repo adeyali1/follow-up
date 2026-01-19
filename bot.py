@@ -522,16 +522,12 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             )
             mm_perf = MultimodalPerf()
             if gemini_live is not None:
-                mm_context = LLMContext(messages=[])
-                mm_aggregators = LLMContextAggregatorPair(
-                    mm_context,
-                    user_params=LLMUserAggregatorParams(
-                        user_turn_strategies=UserTurnStrategies(
-                            start=[TranscriptionUserTurnStartStrategy(use_interim=True)],
-                            stop=[TranscriptionUserTurnStopStrategy(timeout=0.4)],
-                        )
-                    ),
-                )
+                opening_message = build_multimodal_opening_message(greeting_text)
+                mm_context = LLMContext(messages=[{"role": "user", "content": opening_message}])
+                try:
+                    mm_aggregators = gemini_live.create_context_aggregator(mm_context)
+                except Exception:
+                    mm_aggregators = LLMContextAggregatorPair(mm_context)
                 pipeline = Pipeline(
                     [
                         transport.input(),
@@ -546,6 +542,12 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                 )
                 task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
                 runner = PipelineRunner()
+                multimodal_fallback_to_classic = {"value": False}
+
+                @transport.event_handler("on_client_connected")
+                async def _on_client_connected(_transport, _client):
+                    logger.info("Multimodal: client connected, triggering LLMRunFrame")
+                    await task.queue_frames([LLMRunFrame()])
 
                 async def multimodal_stuck_watchdog():
                     timeout_s = 4.0
@@ -572,17 +574,23 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                                 ]
                             )
 
+                async def multimodal_silent_start_fallback():
+                    timeout_s = 3.0
+                    try:
+                        timeout_s = float(os.getenv("MULTIMODAL_START_TIMEOUT_S") or 3.0)
+                    except Exception:
+                        timeout_s = 3.0
+                    await asyncio.sleep(timeout_s)
+                    if _MM.get("last_bot_started_ts") is None:
+                        multimodal_fallback_to_classic["value"] = True
+                        logger.warning("Multimodal: no bot audio detected, falling back to classic pipeline")
+                        await task.cancel()
+
                 asyncio.create_task(multimodal_stuck_watchdog())
-                opening_message = build_multimodal_opening_message(greeting_text)
-                logger.info("Queuing multimodal opening message + LLMRunFrame")
-                await task.queue_frames(
-                    [
-                        LLMMessagesAppendFrame([{"role": "user", "content": opening_message}], run_llm=False),
-                        LLMRunFrame(),
-                    ]
-                )
+                asyncio.create_task(multimodal_silent_start_fallback())
                 await runner.run(task)
-                return
+                if not multimodal_fallback_to_classic["value"]:
+                    return
 
     stt_language = os.getenv("STT_LANGUAGE") or os.getenv("DEEPGRAM_LANGUAGE") or "ar"
     stt_language_enum = resolve_stt_language(stt_language)
