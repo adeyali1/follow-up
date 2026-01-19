@@ -175,7 +175,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 "properties": {
                     "reason": {"type": "string", "description": "Reason for confirmation"}
                 },
-                "required": ["reason"]
             },
         },
         {
@@ -186,16 +185,15 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 "properties": {
                     "reason": {"type": "string", "description": "Reason for cancellation"}
                 },
-                "required": ["reason"]
             },
-        }
+        },
     ]
 
     # Initialize LLM with either path or credentials object
     llm_kwargs = {
         "project_id": os.getenv("GOOGLE_PROJECT_ID"),
         "location": "us-central1",
-        "model": "gemini-2.5-flash-lite",
+        "model": "gemini-1.5-flash",
         "tools": tools
     }
     
@@ -218,15 +216,15 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     tts = GoogleTTSService(**tts_kwargs)
 
     # 3. Handlers
-    async def confirm_order(params):
+    async def confirm_order(function_name, tool_call_id, args, llm, context, result_callback):
         logger.info(f"Confirming order for lead {lead_data['id']}")
         update_lead_status(lead_data['id'], 'CONFIRMED')
-        await params.result_callback("Order confirmed successfully.")
+        await result_callback("Order confirmed successfully.")
 
-    async def cancel_order(params):
+    async def cancel_order(function_name, tool_call_id, args, llm, context, result_callback):
         logger.info(f"Cancelling order for lead {lead_data['id']}")
         update_lead_status(lead_data['id'], 'CANCELLED')
-        await params.result_callback("Order cancelled.")
+        await result_callback("Order cancelled.")
 
     llm.register_function(
         "update_lead_status_confirmed",
@@ -251,8 +249,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         stream_id=stream_id, # Captured from handshake
         call_control_id=call_control_id,
         api_key=os.getenv("TELNYX_API_KEY"),
-        outbound_encoding=inbound_encoding, # Sync with detected encoding
-        inbound_encoding=inbound_encoding, # Use detected encoding
+        outbound_encoding="PCMA", # Force PCMA for Jordan
+        inbound_encoding="PCMA", # Force PCMA for Jordan
         params=TelnyxFrameSerializer.InputParams(
             sample_rate=8000
         )
@@ -308,10 +306,10 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     
     runner = PipelineRunner()
     
-    # Queue context frame to set state, and MessagesFrame to trigger generation
-    # We send the same messages in LLMMessagesFrame to explicitly trigger the LLM to run now.
+    # Queue context frame to set state, and LLMContextFrame to trigger generation (Updated)
+    # We send the same messages in LLMContextFrame to explicitly trigger the LLM to run now.
     logger.info("Queuing initial context and trigger messages...")
-    await task.queue_frames([context_frame, LLMMessagesFrame(messages)])
+    await task.queue_frames([context_frame, LLMContextFrame(context)])
 
     logger.info("Starting pipeline runner...")
     await runner.run(task)
