@@ -35,31 +35,47 @@ _PERF = {"last_user_text_ts": None, "last_llm_start_ts": None, "tts_first_audio_
 
 def build_deepgram_live_options(*, encoding: str, sample_rate: int, language: str) -> LiveOptions:
     language = (language or "ar").strip()
-    model = os.getenv("DEEPGRAM_MODEL")
+    model = (os.getenv("DEEPGRAM_MODEL") or "").strip() or None
     if not model:
         model = "nova-2-phonecall" if language.startswith("en") else "nova-2"
 
-    utterance_end_ms = 1000
-    try:
-        utterance_end_ms_env = os.getenv("DEEPGRAM_UTTERANCE_END_MS")
-        if utterance_end_ms_env:
-            utterance_end_ms = int(float(utterance_end_ms_env))
-    except Exception:
-        utterance_end_ms = 1000
+    smart_format = (os.getenv("DEEPGRAM_SMART_FORMAT") or "true").strip().lower() in {"1", "true", "yes", "y"}
+    punctuate = (os.getenv("DEEPGRAM_PUNCTUATE") or "false").strip().lower() in {"1", "true", "yes", "y"}
+    profanity_filter = (os.getenv("DEEPGRAM_PROFANITY_FILTER") or "false").strip().lower() in {"1", "true", "yes", "y"}
 
-    return LiveOptions(
+    utterance_end_ms = "1000"
+    utterance_end_ms_env = (os.getenv("DEEPGRAM_UTTERANCE_END_MS") or "").strip()
+    if utterance_end_ms_env:
+        if utterance_end_ms_env.lower() in {"0", "false", "off", "none", "null"}:
+            utterance_end_ms = None
+        else:
+            try:
+                utterance_end_ms_int = int(float(utterance_end_ms_env))
+                utterance_end_ms = str(utterance_end_ms_int)
+            except Exception:
+                utterance_end_ms = "1000"
+
+    logger.info(
+        f"Deepgram options: model={model} language={language} encoding={encoding} sample_rate={sample_rate} "
+        f"smart_format={smart_format} punctuate={punctuate} profanity_filter={profanity_filter} "
+        f"utterance_end_ms={utterance_end_ms}"
+    )
+
+    live_options_kwargs = dict(
         encoding=encoding,
         language=language,
         model=model,
         channels=1,
         sample_rate=sample_rate,
         interim_results=True,
-        smart_format=True,
-        punctuate=True,
-        profanity_filter=True,
+        smart_format=smart_format,
+        punctuate=punctuate,
+        profanity_filter=profanity_filter,
         vad_events=False,
-        utterance_end_ms=utterance_end_ms,
     )
+    if utterance_end_ms is not None:
+        live_options_kwargs["utterance_end_ms"] = utterance_end_ms
+    return LiveOptions(**live_options_kwargs)
 
 
 class STTPerf(FrameProcessor):
@@ -106,15 +122,12 @@ class STTFailureFallback(FrameProcessor):
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
-        if (
-            isinstance(frame, ErrorFrame)
-            and not self._handled
-            and isinstance(getattr(frame, "error", None), str)
-            and "Unable to connect to Deepgram" in frame.error
-        ):
-            self._handled = True
-            await self.push_frame(TTSSpeakFrame("صار في مشكلة بالصوت، معك حق. لحظة وبنرجع."), direction)
-            await self.push_frame(EndFrame(), direction)
+        if isinstance(frame, ErrorFrame) and not self._handled:
+            error_text = str(getattr(frame, "error", ""))
+            if "Unable to connect to Deepgram" in error_text:
+                self._handled = True
+                await self.push_frame(TTSSpeakFrame("صار في مشكلة بالصوت، معك حق. لحظة وبنرجع."), direction)
+                await self.push_frame(EndFrame(), direction)
         await self.push_frame(frame, direction)
 
 # Helper function to get Google Credentials
@@ -301,10 +314,12 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     ]
 
     # Initialize LLM with either path or credentials object
+    llm_model = os.getenv("GOOGLE_VERTEX_MODEL") or "gemini-2.0-flash-001"
+    logger.info(f"Using Vertex model: {llm_model}")
     llm_kwargs = {
         "project_id": os.getenv("GOOGLE_PROJECT_ID"),
         "location": "us-central1",
-        "model": os.getenv("GOOGLE_VERTEX_MODEL") or "gemini-2.0-flash-001",
+        "model": llm_model,
         "tools": tools
     }
     
