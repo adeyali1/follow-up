@@ -97,6 +97,40 @@ class MultimodalPerf(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class MultimodalTranscriptRunTrigger(FrameProcessor):
+    def __init__(self, *, delay_s: float):
+        super().__init__()
+        self._delay_s = float(delay_s)
+        self._queue_frames = None
+        self._pending = None
+        self._last_user_transcript_ts = None
+
+    def set_queue_frames(self, queue_frames):
+        self._queue_frames = queue_frames
+
+    async def _schedule(self, ts: float):
+        try:
+            await asyncio.sleep(self._delay_s)
+        except asyncio.CancelledError:
+            return
+        if self._queue_frames is None:
+            return
+        if self._last_user_transcript_ts != ts:
+            return
+        logger.info("Multimodal: user transcript idle → LLMRunFrame")
+        await self._queue_frames([LLMRunFrame()])
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame) and getattr(frame, "role", None) == "user":
+            now = time.monotonic()
+            self._last_user_transcript_ts = now
+            if self._pending is not None:
+                self._pending.cancel()
+            self._pending = asyncio.create_task(self._schedule(now))
+        await self.push_frame(frame, direction)
+
+
 def resolve_stt_language(language: str) -> Language:
     normalized = (language or "").strip().lower()
     if normalized.startswith("ar"):
@@ -377,7 +411,17 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     
     use_smart_turn = (os.getenv("USE_SMART_TURN") or "true").strip().lower() in {"1", "true", "yes", "y"}
     vad_stop_secs = 0.2 if use_smart_turn else 0.4
-    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=vad_stop_secs, confidence=0.45))
+    try:
+        vad_min_volume = float(os.getenv("VAD_MIN_VOLUME") or 0.6)
+    except Exception:
+        vad_min_volume = 0.6
+    try:
+        vad_confidence = float(os.getenv("VAD_CONFIDENCE") or 0.7)
+    except Exception:
+        vad_confidence = 0.7
+    vad = SileroVADAnalyzer(
+        params=VADParams(min_volume=vad_min_volume, start_secs=0.2, stop_secs=vad_stop_secs, confidence=vad_confidence)
+    )
 
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
@@ -552,12 +596,15 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         opening_message = build_multimodal_opening_message(greeting_text)
         mm_context = LLMContext(messages=[{"role": "user", "content": opening_message}])
         user_mute_strategies = []
-        try:
-            from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
+        mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
+        if mute_first_bot:
+            try:
+                from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
 
-            user_mute_strategies.append(MuteUntilFirstBotCompleteUserMuteStrategy())
-        except Exception:
-            pass
+                user_mute_strategies.append(MuteUntilFirstBotCompleteUserMuteStrategy())
+            except Exception:
+                pass
+        logger.info(f"Multimodal mute until first bot complete: {bool(user_mute_strategies)}")
         mm_aggregators = LLMContextAggregatorPair(
             mm_context,
             user_params=LLMUserAggregatorParams(user_mute_strategies=user_mute_strategies),
@@ -584,12 +631,20 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             else:
                 logger.error(f"GeminiLive error: {msg}")
 
+        transcript_run_delay_s = 0.7
+        try:
+            transcript_run_delay_s = float(os.getenv("MULTIMODAL_TRANSCRIPT_STOP_S") or 0.7)
+        except Exception:
+            transcript_run_delay_s = 0.7
+        transcript_trigger = MultimodalTranscriptRunTrigger(delay_s=transcript_run_delay_s)
+
         pipeline = Pipeline(
             [
                 transport.input(),
                 mm_aggregators.user(),
                 input_resampler,
                 gemini_live,
+                transcript_trigger,
                 mm_perf,
                 output_resampler,
                 transport.output(),
@@ -597,6 +652,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             ]
         )
         task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+        transcript_trigger.set_queue_frames(task.queue_frames)
         runner = PipelineRunner()
         did_trigger_initial_run = {"value": False}
         live_connection_failed = {"value": False}
@@ -609,12 +665,23 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             logger.info("Multimodal: client connected, triggering LLMRunFrame")
             await task.queue_frames([LLMRunFrame()])
 
-        async def multimodal_stuck_watchdog():
-            timeout_s = 4.0
+        async def multimodal_first_turn_failsafe():
+            timeout_s = 8.0
             try:
-                timeout_s = float(os.getenv("MULTIMODAL_STUCK_TIMEOUT_S") or 4.0)
+                timeout_s = float(os.getenv("MULTIMODAL_FIRST_TURN_FAILSAFE_S") or 8.0)
             except Exception:
-                timeout_s = 4.0
+                timeout_s = 8.0
+            await asyncio.sleep(timeout_s)
+            if _MM.get("last_bot_started_ts") is None and not live_connection_failed["value"]:
+                logger.warning("Multimodal: first bot audio not detected yet; re-triggering LLMRunFrame")
+                await task.queue_frames([LLMRunFrame()])
+
+        async def multimodal_stuck_watchdog():
+            timeout_s = 10.0
+            try:
+                timeout_s = float(os.getenv("MULTIMODAL_STUCK_TIMEOUT_S") or 10.0)
+            except Exception:
+                timeout_s = 10.0
             while True:
                 await asyncio.sleep(0.5)
                 user_ts = _MM.get("last_user_transcription_ts")
@@ -633,11 +700,11 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                     )
 
         async def multimodal_silent_start_retry():
-            timeout_s = 3.0
+            timeout_s = 6.0
             try:
-                timeout_s = float(os.getenv("MULTIMODAL_START_TIMEOUT_S") or 3.0)
+                timeout_s = float(os.getenv("MULTIMODAL_START_TIMEOUT_S") or 6.0)
             except Exception:
-                timeout_s = 3.0
+                timeout_s = 6.0
             max_retries = 3
             try:
                 max_retries = int(os.getenv("MULTIMODAL_MAX_START_RETRIES") or 3)
@@ -660,6 +727,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
 
         asyncio.create_task(multimodal_stuck_watchdog())
         asyncio.create_task(multimodal_silent_start_retry())
+        asyncio.create_task(multimodal_first_turn_failsafe())
         await runner.run(task)
         return
 
