@@ -193,7 +193,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     llm_kwargs = {
         "project_id": os.getenv("GOOGLE_PROJECT_ID"),
         "location": "us-central1",
-        "model": "gemini-1.5-flash",
+        "model": "gemini-2.0-flash-lite-preview-02-05",
         "tools": tools
     }
     
