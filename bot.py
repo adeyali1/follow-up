@@ -38,7 +38,7 @@ from pipecat.audio.utils import create_stream_resampler
 _GOOGLE_TTS_VOICE_NAMES = None
 _PERF = {"last_user_text_ts": None, "last_llm_start_ts": None, "tts_first_audio_logged": False}
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None}
-BOT_BUILD_ID = "2026-01-20-multimodal-llmrunframe-FIXED"
+BOT_BUILD_ID = "2026-01-20-multimodal-llmrunframe"
 
 
 class STTPerf(FrameProcessor):
@@ -377,9 +377,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     
     use_smart_turn = (os.getenv("USE_SMART_TURN") or "true").strip().lower() in {"1", "true", "yes", "y"}
     vad_stop_secs = 0.2 if use_smart_turn else 0.4
-    
-    # --- FIX 1 APPLIED: Increased VAD sensitivity ---
-    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.6, start_secs=0.2, stop_secs=vad_stop_secs, confidence=0.7))
+    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=vad_stop_secs, confidence=0.45))
 
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
@@ -450,7 +448,8 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         except Exception:
             gemini_in_sample_rate = 16000
 
-        model = normalize_gemini_live_model_name(os.getenv("GEMINI_LIVE_MODEL") or "gemini-2.0-flash-live-001")
+        model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
+        model = normalize_gemini_live_model_name(model_env) if model_env else None
         voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Charon").strip()
         from pipecat.services.google.gemini_live.llm import (
             GeminiLiveLLMService as GeminiLiveService,
@@ -471,17 +470,19 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         except Exception:
             pass
         logger.info(
-            f"GeminiLive mode enabled (model={model}, voice={voice_id}, in_sr={gemini_in_sample_rate}, out_sr={stream_sample_rate})"
+            f"GeminiLive mode enabled (model={model or 'DEFAULT'}, voice={voice_id}, in_sr={gemini_in_sample_rate}, out_sr={stream_sample_rate})"
         )
         try:
-            gemini_live = GeminiLiveService(
-                api_key=api_key,
-                model=model,
-                voice_id=voice_id,
-                system_instruction=system_prompt,
-                params=gemini_params,
-                inference_on_context_initialization=True,
-            )
+            gemini_kwargs = {
+                "api_key": api_key,
+                "voice_id": voice_id,
+                "system_instruction": system_prompt,
+                "params": gemini_params,
+                "inference_on_context_initialization": True,
+            }
+            if model:
+                gemini_kwargs["model"] = model
+            gemini_live = GeminiLiveService(**gemini_kwargs)
         except Exception as e:
             logger.error(f"GeminiLive init failed. ({e})")
             return
@@ -536,9 +537,18 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         except Exception:
             mm_aggregators = LLMContextAggregatorPair(mm_context)
         try:
-            await gemini_live.set_context(mm_context)
+            gemini_live.set_context(mm_context)
         except Exception:
             pass
+
+        @gemini_live.event_handler("on_error")
+        async def _on_gemini_live_error(service, error):
+            msg = str(error)
+            if "received 1008" in msg or "policy violation" in msg or "is not found" in msg or "bidiGenerateContent" in msg:
+                live_connection_failed["value"] = True
+                logger.error(f"GeminiLive rejected model/key: {msg}")
+            else:
+                logger.error(f"GeminiLive error: {msg}")
 
         pipeline = Pipeline(
             [
@@ -555,6 +565,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
         runner = PipelineRunner()
         did_trigger_initial_run = {"value": False}
+        live_connection_failed = {"value": False}
 
         @transport.event_handler("on_client_connected")
         async def _on_client_connected(_transport, _client):
@@ -565,12 +576,11 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             await task.queue_frames([LLMRunFrame()])
 
         async def multimodal_stuck_watchdog():
-            # --- FIX 2 APPLIED: Increased watchdog timeout ---
-            timeout_s = 10.0 # Increased from 4.0
+            timeout_s = 4.0
             try:
-                timeout_s = float(os.getenv("MULTIMODAL_STUCK_TIMEOUT_S") or 10.0)
+                timeout_s = float(os.getenv("MULTIMODAL_STUCK_TIMEOUT_S") or 4.0)
             except Exception:
-                timeout_s = 10.0
+                timeout_s = 4.0
             while True:
                 await asyncio.sleep(0.5)
                 user_ts = _MM.get("last_user_transcription_ts")
@@ -589,12 +599,11 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                     )
 
         async def multimodal_silent_start_retry():
-            # --- FIX 3 APPLIED: Increased silent start timeout ---
-            timeout_s = 6.0 # Increased from 3.0
+            timeout_s = 3.0
             try:
-                timeout_s = float(os.getenv("MULTIMODAL_START_TIMEOUT_S") or 6.0)
+                timeout_s = float(os.getenv("MULTIMODAL_START_TIMEOUT_S") or 3.0)
             except Exception:
-                timeout_s = 6.0
+                timeout_s = 3.0
             max_retries = 3
             try:
                 max_retries = int(os.getenv("MULTIMODAL_MAX_START_RETRIES") or 3)
@@ -602,6 +611,9 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                 max_retries = 3
             for attempt in range(max_retries):
                 await asyncio.sleep(timeout_s)
+                if live_connection_failed["value"]:
+                    logger.error("Multimodal: live connection failed (model/key). Stop retrying.")
+                    return
                 if _MM.get("last_bot_started_ts") is not None:
                     return
                 logger.warning(f"Multimodal: no bot audio detected, retrying LLMRunFrame (attempt {attempt + 1}/{max_retries})")
