@@ -295,6 +295,7 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     context_frame = LLMContextFrame(context)
 
     # 5. Pipeline
+    # Disable user turn strategies to prevent false interruptions from Telnyx comfort noise
     user_agg = LLMUserAggregator(context)
     assistant_agg = LLMAssistantAggregator(context)
 
@@ -308,7 +309,8 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
         transport.output()
     ])
 
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+    # Allow interruptions must be False to prevent Telnyx comfort noise from cancelling TTS
+    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=False))
     
     runner = PipelineRunner()
     
