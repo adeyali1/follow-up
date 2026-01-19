@@ -21,6 +21,9 @@ from services.supabase_service import update_lead_status
 
 import json
 from google.oauth2 import service_account
+from google.cloud import texttospeech_v1
+
+_GOOGLE_TTS_VOICE_NAMES = None
 
 # Helper function to get Google Credentials
 def get_google_credentials():
@@ -211,8 +214,26 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     llm = GoogleVertexLLMService(**llm_kwargs)
     
     tts_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
+    voice_id = os.getenv("GOOGLE_TTS_VOICE_ID") or "ar-XA-Standard-A"
+    fallback_voice_id = "ar-XA-Standard-A"
+    global _GOOGLE_TTS_VOICE_NAMES
+    try:
+        if _GOOGLE_TTS_VOICE_NAMES is None:
+            client = (
+                texttospeech_v1.TextToSpeechClient(credentials=google_creds_obj)
+                if google_creds_obj
+                else texttospeech_v1.TextToSpeechClient()
+            )
+            _GOOGLE_TTS_VOICE_NAMES = {v.name for v in client.list_voices().voices}
+        if voice_id not in _GOOGLE_TTS_VOICE_NAMES:
+            logger.warning(f"Google TTS voice not found: {voice_id}. Falling back to {fallback_voice_id}.")
+            voice_id = fallback_voice_id
+    except Exception as e:
+        if voice_id.startswith("ar-JO"):
+            logger.warning(f"Google TTS voice {voice_id} likely invalid. Falling back to {fallback_voice_id}. ({e})")
+            voice_id = fallback_voice_id
     tts_kwargs = {
-        "voice_id": "ar-JO-Standard-A",
+        "voice_id": voice_id,
         "sample_rate": 8000,
         "encoding": tts_encoding
     }
