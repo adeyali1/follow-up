@@ -530,6 +530,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
 - **Style**: Use the Ammani/Urban Jordanian dialect.
 - **Efficiency**: Jordanians appreciate quick calls. Keep responses under 10 words unless explaining something.
 - **Rules**: Never speak Formal Arabic (Fusha). Never speak English unless the customer starts in English.
+- **Jordanian Only**: If you catch yourself using non-Jordanian words, immediately rephrase in Jordanian.
 
 # MANDATORY OPENING (First Phrase)
 Your very first sentence must be EXACTLY:
@@ -560,7 +561,7 @@ Your very first sentence must be EXACTLY:
     context = LLMContext(messages=messages)
 
     user_turn_strategies = UserTurnStrategies(
-        start=[TranscriptionUserTurnStartStrategy(use_interim=False)],
+        start=[TranscriptionUserTurnStartStrategy(use_interim=True)],
         stop=[TranscriptionUserTurnStopStrategy(timeout=0.4)],
     )
 
@@ -568,8 +569,8 @@ Your very first sentence must be EXACTLY:
         context,
         user_params=LLMUserAggregatorParams(
             user_turn_strategies=user_turn_strategies,
-            user_mute_strategies=[MuteUntilFirstBotCompleteUserMuteStrategy()],
-            user_turn_stop_timeout=0.6,
+            user_mute_strategies=[],
+            user_turn_stop_timeout=0.5,
         ),
     )
 
