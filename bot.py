@@ -16,6 +16,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, Fast
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.transcriptions.language import Language
 from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
 from services.supabase_service import update_lead_status
 
@@ -241,7 +242,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     tts_kwargs = {
         "voice_id": voice_id,
         "sample_rate": 8000,
-        "encoding": tts_encoding
+        "encoding": tts_encoding,
+        "params": GoogleTTSService.InputParams(language=Language.AR)
     }
     if google_creds_obj:
         tts_kwargs["credentials"] = google_creds_obj
