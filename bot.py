@@ -520,7 +520,28 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             )
             mm_perf = MultimodalPerf()
             if gemini_live is not None:
-                pipeline = Pipeline([transport.input(), resampler, gemini_live, mm_perf, resampler, transport.output()])
+                mm_context = LLMContext(messages=[])
+                mm_aggregators = LLMContextAggregatorPair(
+                    mm_context,
+                    user_params=LLMUserAggregatorParams(
+                        user_turn_strategies=UserTurnStrategies(
+                            start=[TranscriptionUserTurnStartStrategy(use_interim=True)],
+                            stop=[TranscriptionUserTurnStopStrategy(timeout=0.4)],
+                        )
+                    ),
+                )
+                pipeline = Pipeline(
+                    [
+                        transport.input(),
+                        mm_aggregators.user(),
+                        resampler,
+                        gemini_live,
+                        mm_perf,
+                        resampler,
+                        transport.output(),
+                        mm_aggregators.assistant(),
+                    ]
+                )
                 task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
                 runner = PipelineRunner()
 
@@ -806,3 +827,4 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
     asyncio.create_task(post_greeting_follow_up())
     logger.info("Starting single pipeline run")
     await runner.run(task)
+v
