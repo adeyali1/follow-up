@@ -165,7 +165,7 @@ async def process_campaign(campaign_id: str):
                 connection_id=TELNYX_CONNECTION_ID,
                 webhook_url=webhook_url,
                 client_state=client_state,
-                preferred_codecs="PCMU"
+                preferred_codecs="PCMA"
             )
             # Handle response object safely
             call_control_id = getattr(call, 'call_control_id', None)
@@ -247,10 +247,10 @@ async def webhook_route(request: Request):
                         }
                         payload_data = {
                             "stream_url": stream_url,
-                            "stream_track": "inbound_track", # Changed from both_tracks to inbound_track
-                            "enable_dialogflow": False, # Ensure this is off
+                            "stream_track": "both_tracks",
+                            "enable_dialogflow": False,
                             "stream_bidirectional_mode": "rtp",
-                            "stream_bidirectional_codec": "PCMU" # Force PCMU codec for the stream
+                            "stream_bidirectional_codec": "PCMA"
                         }
                         async with session.post(fork_url, headers=headers, json=payload_data) as response:
                                 print(f"Fallback HTTP Status: {response.status}")
