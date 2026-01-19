@@ -297,6 +297,8 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
 
     # 5. Pipeline Phase 1: Greeting (NO STT)
     # This guarantees the greeting is spoken before any audio input can trigger interruptions.
+    assistant_agg = LLMAssistantAggregator(context)
+    
     pipeline_greeting = Pipeline([
         llm,
         assistant_agg,
