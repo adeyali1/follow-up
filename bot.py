@@ -17,7 +17,7 @@ from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.frames.frames import TranscriptionFrame, LLMFullResponseStartFrame, TTSAudioRawFrame
+from pipecat.frames.frames import EndFrame, ErrorFrame, TranscriptionFrame, LLMFullResponseStartFrame, TTSAudioRawFrame
 from pipecat.transcriptions.language import Language
 from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy
@@ -31,6 +31,35 @@ from google.cloud import texttospeech_v1
 
 _GOOGLE_TTS_VOICE_NAMES = None
 _PERF = {"last_user_text_ts": None, "last_llm_start_ts": None, "tts_first_audio_logged": False}
+
+
+def build_deepgram_live_options(*, encoding: str, sample_rate: int, language: str) -> LiveOptions:
+    language = (language or "ar").strip()
+    model = os.getenv("DEEPGRAM_MODEL")
+    if not model:
+        model = "nova-2-phonecall" if language.startswith("en") else "nova-2"
+
+    utterance_end_ms = 1000
+    try:
+        utterance_end_ms_env = os.getenv("DEEPGRAM_UTTERANCE_END_MS")
+        if utterance_end_ms_env:
+            utterance_end_ms = int(float(utterance_end_ms_env))
+    except Exception:
+        utterance_end_ms = 1000
+
+    return LiveOptions(
+        encoding=encoding,
+        language=language,
+        model=model,
+        channels=1,
+        sample_rate=sample_rate,
+        interim_results=True,
+        smart_format=True,
+        punctuate=True,
+        profanity_filter=True,
+        vad_events=False,
+        utterance_end_ms=utterance_end_ms,
+    )
 
 
 class STTPerf(FrameProcessor):
@@ -67,6 +96,25 @@ class TTSPerf(FrameProcessor):
             if user_ts is not None:
                 logger.info(f"Latency user_text→tts_audio={now - user_ts:.3f}s")
             _PERF["tts_first_audio_logged"] = True
+        await self.push_frame(frame, direction)
+
+
+class STTFailureFallback(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self._handled = False
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if (
+            isinstance(frame, ErrorFrame)
+            and not self._handled
+            and isinstance(getattr(frame, "error", None), str)
+            and "Unable to connect to Deepgram" in frame.error
+        ):
+            self._handled = True
+            await self.push_frame(TTSSpeakFrame("صار في مشكلة بالصوت، معك حق. لحظة وبنرجع."), direction)
+            await self.push_frame(EndFrame(), direction)
         await self.push_frame(frame, direction)
 
 # Helper function to get Google Credentials
@@ -213,18 +261,11 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     dg_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
     logger.info(f"Initializing Deepgram with encoding: {dg_encoding} (inbound: {inbound_encoding})")
 
-    stt_live_options = LiveOptions(
+    stt_language = os.getenv("DEEPGRAM_LANGUAGE") or "ar"
+    stt_live_options = build_deepgram_live_options(
         encoding=dg_encoding,
-        language="ar",
-        model="nova-2-phonecall",
-        channels=1,
         sample_rate=stream_sample_rate,
-        interim_results=True,
-        smart_format=True,
-        punctuate=True,
-        profanity_filter=True,
-        vad_events=False,
-        utterance_end_ms=1000,
+        language=stt_language,
     )
     stt = DeepgramSTTService(
         api_key=deepgram_key,
@@ -439,6 +480,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     pipeline = Pipeline([
         transport.input(),
         stt,
+        STTFailureFallback(),
         stt_perf,
         aggregators.user(),
         llm,
