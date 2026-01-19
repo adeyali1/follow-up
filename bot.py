@@ -394,7 +394,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     user_turn_strategies = UserTurnStrategies(
         start=[TranscriptionUserTurnStartStrategy(use_interim=False)],
-        stop=[TranscriptionUserTurnStopStrategy(timeout=0.35)],
+        stop=[TranscriptionUserTurnStopStrategy(timeout=0.30)],
     )
 
     aggregators = LLMContextAggregatorPair(
@@ -402,7 +402,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         user_params=LLMUserAggregatorParams(
             user_turn_strategies=user_turn_strategies,
             user_mute_strategies=[MuteUntilFirstBotCompleteUserMuteStrategy()],
-            user_turn_stop_timeout=1.5,
+            user_turn_stop_timeout=1.2,
         ),
     )
 
