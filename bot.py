@@ -457,10 +457,15 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         )
 
         gemini_params = GeminiLiveInputParams(temperature=0.3)
-        try:
-            gemini_params.language = Language.AR
-        except Exception:
-            pass
+        gemini_language_env = (os.getenv("GEMINI_LIVE_LANGUAGE") or "").strip()
+        if gemini_language_env:
+            try:
+                if gemini_language_env.lower().startswith("en"):
+                    gemini_params.language = Language.EN
+                elif gemini_language_env.lower().startswith("ar"):
+                    gemini_params.language = Language.AR
+            except Exception:
+                pass
         try:
             gemini_params.sample_rate = gemini_in_sample_rate
         except Exception:
@@ -537,14 +542,22 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         except Exception:
             mm_aggregators = LLMContextAggregatorPair(mm_context)
         try:
-            gemini_live.set_context(mm_context)
+            maybe_coro = gemini_live.set_context(mm_context)
+            if asyncio.iscoroutine(maybe_coro):
+                await maybe_coro
         except Exception:
             pass
 
         @gemini_live.event_handler("on_error")
         async def _on_gemini_live_error(service, error):
             msg = str(error)
-            if "received 1008" in msg or "policy violation" in msg or "is not found" in msg or "bidiGenerateContent" in msg:
+            if "Unsupported language code 'ar-XA'" in msg or "Unsupported language code" in msg:
+                live_connection_failed["value"] = True
+                logger.error(
+                    "GeminiLive language mismatch. Remove GEMINI_LIVE_LANGUAGE or set GEMINI_LIVE_LANGUAGE=en-US."
+                )
+                logger.error(msg)
+            elif "received 1008" in msg or "policy violation" in msg or "is not found" in msg or "bidiGenerateContent" in msg:
                 live_connection_failed["value"] = True
                 logger.error(f"GeminiLive rejected model/key: {msg}")
             else:
