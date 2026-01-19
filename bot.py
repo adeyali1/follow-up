@@ -306,7 +306,7 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
         transport.output()
     ])
 
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=False))
     
     runner = PipelineRunner()
     
