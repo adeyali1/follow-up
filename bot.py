@@ -25,6 +25,7 @@ from services.supabase_service import update_lead_status
 
 import json
 import time
+from deepgram import LiveOptions
 from google.oauth2 import service_account
 from google.cloud import texttospeech_v1
 
@@ -201,7 +202,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         google_creds_obj = service_account.Credentials.from_service_account_info(google_creds_dict)
     
     # 1. Services
-    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.15, stop_secs=0.25, confidence=0.45))
+    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.15, stop_secs=0.4, confidence=0.45))
     
     deepgram_key = os.getenv("DEEPGRAM_API_KEY")
     if not deepgram_key:
@@ -212,12 +213,22 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     dg_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
     logger.info(f"Initializing Deepgram with encoding: {dg_encoding} (inbound: {inbound_encoding})")
 
+    stt_live_options = LiveOptions(
+        encoding=dg_encoding,
+        language="ar",
+        model="nova-2-phonecall",
+        channels=1,
+        sample_rate=stream_sample_rate,
+        interim_results=True,
+        smart_format=True,
+        punctuate=True,
+        profanity_filter=True,
+        vad_events=False,
+        utterance_end_ms=1000,
+    )
     stt = DeepgramSTTService(
         api_key=deepgram_key,
-        model="nova-2",
-        language="ar",
-        sample_rate=stream_sample_rate,
-        encoding=dg_encoding
+        live_options=stt_live_options,
     )
     
     # 2. Tools
@@ -252,7 +263,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     llm_kwargs = {
         "project_id": os.getenv("GOOGLE_PROJECT_ID"),
         "location": "us-central1",
-        "model": "gemini-2.5-flash-lite",
+        "model": os.getenv("GOOGLE_VERTEX_MODEL") or "gemini-2.0-flash-001",
         "tools": tools
     }
     
@@ -266,7 +277,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     tts_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
     tts_sample_rate = stream_sample_rate
     voice_id = os.getenv("GOOGLE_TTS_VOICE_ID") or "ar-XA-Chirp3-HD-Charon"
-    fallback_voice_id = "ar-XA-Chirp3-HD-Charon"
+    fallback_voice_ids = ["ar-XA-Chirp3-HD-Charon", "ar-XA-Chirp3-HD-Aoede"]
     global _GOOGLE_TTS_VOICE_NAMES
     try:
         if _GOOGLE_TTS_VOICE_NAMES is None:
@@ -283,10 +294,19 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 logger.warning(f"Non-Chirp voice configured for streaming TTS ({voice_id}); switching to {candidates[0]}.")
                 voice_id = candidates[0]
         if voice_id not in _GOOGLE_TTS_VOICE_NAMES:
-            logger.warning(f"Google TTS voice not found: {voice_id}. Falling back to {fallback_voice_id}.")
-            voice_id = fallback_voice_id
+            fallback_voice_id = next((v for v in fallback_voice_ids if v in _GOOGLE_TTS_VOICE_NAMES), None)
+            if fallback_voice_id:
+                logger.warning(f"Google TTS voice not found: {voice_id}. Falling back to {fallback_voice_id}.")
+                voice_id = fallback_voice_id
+            else:
+                locale = "ar-XA"
+                candidates = [v for v in _GOOGLE_TTS_VOICE_NAMES if v.startswith(f"{locale}-Chirp3-HD-")]
+                if candidates:
+                    logger.warning(f"Google TTS voice not found: {voice_id}. Falling back to {candidates[0]}.")
+                    voice_id = candidates[0]
     except Exception as e:
         if voice_id.startswith("ar-JO"):
+            fallback_voice_id = fallback_voice_ids[0]
             logger.warning(f"Google TTS voice {voice_id} likely invalid. Falling back to {fallback_voice_id}. ({e})")
             voice_id = fallback_voice_id
     speaking_rate = None
@@ -368,7 +388,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     )
 
     # 4. Prompt
-    system_prompt = f"""أنت \"كوكب\" مساعد تأكيد طلبات للتوصيل في الأردن. احكي عامية أردنية طبيعية وبأسلوب ودود.
+    system_prompt = f"""أنت \"كوكب\" مساعد تأكيد طلبات للتوصيل في الأردن. احكي عامية أردنية طبيعية (لهجة عَمّان الحضرية) وبأسلوب ودود.
 خليك مختصر: جُمل قصيرة وما تطوّل.
 
 معلومات الطلب:
@@ -385,6 +405,9 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 قواعد اللغة:
 - لا تحكي إنجليزي إلا إذا العميل حكى إنجليزي.
 - خلي أسماء المنتجات/الأسماء زي ما هي بدون تعريب مبالغ فيه.
+- استخدم: \"ليش\" بدل \"لماذا\"، و\"هون\" بدل \"هنا\"، و\"عشان هيك\" بدل \"لهيك\".
+- استخدم تعبيرات خفيفة وطبيعية حسب السياق: \"تمام\"، \"مية مية\"، \"يا هلا والله\" بدون مبالغة.
+- إذا العميل قال \"Hello\" أو \"Are you there\" أو \"ألو\" أو \"وينك\" أو \"معك؟\": رد مرة واحدة \"معك معك، تفضل\" وارجع مباشرةً للمهمة بدون ما تعيد التحية.
 """
 
     # 4. Prompt & Context
@@ -397,7 +420,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     user_turn_strategies = UserTurnStrategies(
         start=[TranscriptionUserTurnStartStrategy(use_interim=False)],
-        stop=[TranscriptionUserTurnStopStrategy(timeout=0.30)],
+        stop=[TranscriptionUserTurnStopStrategy(timeout=0.4)],
     )
 
     aggregators = LLMContextAggregatorPair(
@@ -405,7 +428,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         user_params=LLMUserAggregatorParams(
             user_turn_strategies=user_turn_strategies,
             user_mute_strategies=[MuteUntilFirstBotCompleteUserMuteStrategy()],
-            user_turn_stop_timeout=1.2,
+            user_turn_stop_timeout=0.6,
         ),
     )
 
