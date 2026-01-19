@@ -34,6 +34,7 @@ _PERF = {"last_user_text_ts": None, "last_llm_start_ts": None, "tts_first_audio_
 
 class STTPerf(FrameProcessor):
     async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame):
             _PERF["last_user_text_ts"] = time.monotonic()
             _PERF["last_llm_start_ts"] = None
@@ -43,6 +44,7 @@ class STTPerf(FrameProcessor):
 
 class LLMPerf(FrameProcessor):
     async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
         if isinstance(frame, LLMFullResponseStartFrame):
             now = time.monotonic()
             _PERF["last_llm_start_ts"] = now
@@ -54,6 +56,7 @@ class LLMPerf(FrameProcessor):
 
 class TTSPerf(FrameProcessor):
     async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
         if isinstance(frame, TTSAudioRawFrame) and not _PERF.get("tts_first_audio_logged"):
             now = time.monotonic()
             llm_ts = _PERF.get("last_llm_start_ts")
