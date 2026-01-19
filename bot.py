@@ -23,7 +23,7 @@ from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.frames.frames import TranscriptionFrame, LLMFullResponseStartFrame, TTSAudioRawFrame
+from pipecat.frames.frames import InputAudioRawFrame, OutputAudioRawFrame, TranscriptionFrame, LLMFullResponseStartFrame, TTSAudioRawFrame
 from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy
 from services.supabase_service import update_lead_status
@@ -33,9 +33,11 @@ import time
 from google.oauth2 import service_account
 from google.cloud import texttospeech_v1
 from deepgram import LiveOptions
+from pipecat.audio.utils import create_stream_resampler
 
 _GOOGLE_TTS_VOICE_NAMES = None
 _PERF = {"last_user_text_ts": None, "last_llm_start_ts": None, "tts_first_audio_logged": False}
+_MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None}
 
 
 class STTPerf(FrameProcessor):
@@ -72,6 +74,25 @@ class TTSPerf(FrameProcessor):
             if user_ts is not None:
                 logger.info(f"Latency user_text→tts_audio={now - user_ts:.3f}s")
             _PERF["tts_first_audio_logged"] = True
+        await self.push_frame(frame, direction)
+
+
+class MultimodalPerf(FrameProcessor):
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        frame_name = type(frame).__name__
+        if frame_name == "TranscriptionFrame":
+            try:
+                if getattr(frame, "role", None) == "user":
+                    _MM["last_user_transcription_ts"] = time.monotonic()
+            except Exception:
+                pass
+        if frame_name in {"BotStartedSpeakingFrame", "TTSStartedFrame"}:
+            now = time.monotonic()
+            _MM["last_bot_started_ts"] = now
+            user_ts = _MM.get("last_user_transcription_ts")
+            if user_ts is not None:
+                logger.info(f"Latency multimodal user_transcription→bot_audio={now - user_ts:.3f}s")
         await self.push_frame(frame, direction)
 
 
@@ -160,6 +181,25 @@ class JordanianTTSPreprocessor(FrameProcessor):
                 if should_drop_tts_text(text):
                     return
                 frame.text = text
+        await self.push_frame(frame, direction)
+
+
+class AudioSampleRateResampler(FrameProcessor):
+    def __init__(self, *, target_input_sample_rate: int, target_output_sample_rate: int):
+        super().__init__()
+        self._target_in = int(target_input_sample_rate)
+        self._target_out = int(target_output_sample_rate)
+        self._in_resampler = create_stream_resampler()
+        self._out_resampler = create_stream_resampler()
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame) and frame.sample_rate != self._target_in:
+            resampled = await self._in_resampler.resample(frame.audio, frame.sample_rate, self._target_in)
+            frame = InputAudioRawFrame(audio=resampled, sample_rate=self._target_in, num_channels=frame.num_channels)
+        elif isinstance(frame, OutputAudioRawFrame) and frame.sample_rate != self._target_out:
+            resampled = await self._out_resampler.resample(frame.audio, frame.sample_rate, self._target_out)
+            frame = OutputAudioRawFrame(audio=resampled, sample_rate=self._target_out, num_channels=frame.num_channels)
         await self.push_frame(frame, direction)
 
 
@@ -390,6 +430,12 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         if not api_key:
             logger.error("USE_MULTIMODAL_LIVE=true but GOOGLE_API_KEY/GEMINI_API_KEY is missing. Falling back.")
         else:
+            gemini_in_sample_rate = 16000
+            try:
+                gemini_in_sample_rate = int(os.getenv("GEMINI_LIVE_SAMPLE_RATE") or 16000)
+            except Exception:
+                gemini_in_sample_rate = 16000
+
             model = normalize_gemini_live_model_name(os.getenv("GEMINI_LIVE_MODEL") or "gemini-2.0-flash-exp")
             voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Charon").strip()
             try:
@@ -404,6 +450,18 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                 )
 
             gemini_params = GeminiLiveInputParams(temperature=0.3)
+            try:
+                gemini_params.language = "ar-XA"
+            except Exception:
+                pass
+            try:
+                gemini_params.sample_rate = gemini_in_sample_rate
+            except Exception:
+                pass
+            try:
+                gemini_params.mime_type = "audio/pcm"
+            except Exception:
+                pass
             gemini_live = GeminiLiveService(
                 api_key=api_key,
                 model=model,
@@ -445,10 +503,41 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             gemini_live.register_function("update_lead_status_confirmed", confirm_order)
             gemini_live.register_function("update_lead_status_cancelled", cancel_order)
 
-            pipeline = Pipeline([transport.input(), gemini_live, transport.output()])
+            resampler = AudioSampleRateResampler(
+                target_input_sample_rate=gemini_in_sample_rate,
+                target_output_sample_rate=stream_sample_rate,
+            )
+            mm_perf = MultimodalPerf()
+            pipeline = Pipeline([transport.input(), resampler, gemini_live, mm_perf, resampler, transport.output()])
             task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
             runner = PipelineRunner()
 
+            async def multimodal_stuck_watchdog():
+                timeout_s = 4.0
+                try:
+                    timeout_s = float(os.getenv("MULTIMODAL_STUCK_TIMEOUT_S") or 4.0)
+                except Exception:
+                    timeout_s = 4.0
+                while True:
+                    await asyncio.sleep(0.5)
+                    user_ts = _MM.get("last_user_transcription_ts")
+                    bot_ts = _MM.get("last_bot_started_ts")
+                    if user_ts is None:
+                        continue
+                    if bot_ts is not None and bot_ts > user_ts:
+                        continue
+                    if time.monotonic() - user_ts >= timeout_s:
+                        _MM["last_user_transcription_ts"] = None
+                        await task.queue_frames(
+                            [
+                                LLMMessagesAppendFrame(
+                                    [{"role": "user", "content": "رد بسرعة وباختصار."}],
+                                    run_llm=True,
+                                )
+                            ]
+                        )
+
+            asyncio.create_task(multimodal_stuck_watchdog())
             await task.queue_frames([LLMMessagesAppendFrame([{"role": "user", "content": greeting_text}], run_llm=True)])
             await runner.run(task)
             return
