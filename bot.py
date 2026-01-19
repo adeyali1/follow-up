@@ -11,7 +11,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
 from pipecat.frames.frames import LLMMessagesAppendFrame
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.google.llm_vertex import GoogleVertexLLMService
@@ -551,7 +551,13 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
 
                 asyncio.create_task(multimodal_stuck_watchdog())
                 opening_message = build_multimodal_opening_message(greeting_text)
-                await task.queue_frames([LLMMessagesAppendFrame([{"role": "user", "content": opening_message}], run_llm=True)])
+                logger.info("Queuing multimodal opening message + LLMRunFrame")
+                await task.queue_frames(
+                    [
+                        LLMMessagesAppendFrame([{"role": "user", "content": opening_message}], run_llm=False),
+                        LLMRunFrame(),
+                    ]
+                )
                 await runner.run(task)
                 return
 
