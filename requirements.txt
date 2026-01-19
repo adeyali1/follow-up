@@ -11,3 +11,4 @@ telnyx
 websockets
 loguru
 openpyxl
+pipecat-ai[local-smart-turn-v3]
