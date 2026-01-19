@@ -7,7 +7,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator, LLMAssistantAggregator
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.frames.frames import LLMContextFrame, EndFrame
+from pipecat.frames.frames import LLMContextFrame, EndFrame, LLMMessagesFrame
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.google.llm_vertex import GoogleVertexLLMService
 from pipecat.services.google.tts import GoogleTTSService
@@ -148,12 +148,21 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     # 1. Services
     vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=0.4, confidence=0.5))
     
+    deepgram_key = os.getenv("DEEPGRAM_API_KEY")
+    if not deepgram_key:
+        logger.error("CRITICAL: DEEPGRAM_API_KEY is missing in environment variables!")
+    else:
+        logger.info(f"Deepgram API Key found (len={len(deepgram_key)}).")
+
+    dg_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
+    logger.info(f"Initializing Deepgram with encoding: {dg_encoding} (inbound: {inbound_encoding})")
+
     stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"),
+        api_key=deepgram_key,
         model="nova-2",
         language="ar",
         sample_rate=8000,
-        encoding="mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
+        encoding=dg_encoding
     )
     
     # 2. Tools
@@ -301,7 +310,10 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     
     runner = PipelineRunner()
     
-    # Queue single initial frame
-    await task.queue_frames([context_frame])
+    # Queue context frame to set state, and MessagesFrame to trigger generation
+    # We send the same messages in LLMMessagesFrame to explicitly trigger the LLM to run now.
+    logger.info("Queuing initial context and trigger messages...")
+    await task.queue_frames([context_frame, LLMMessagesFrame(messages)])
 
+    logger.info("Starting pipeline runner...")
     await runner.run(task)
