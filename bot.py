@@ -451,7 +451,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
 
             gemini_params = GeminiLiveInputParams(temperature=0.3)
             try:
-                gemini_params.language = "ar-XA"
+                gemini_params.language = Language.AR
             except Exception:
                 pass
             try:
