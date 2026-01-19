@@ -477,6 +477,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                     voice_id=voice_id,
                     system_instruction=system_prompt,
                     params=gemini_params,
+                    inference_on_context_initialization=True,
                 )
             except Exception as e:
                 logger.error(f"GeminiLive init failed; falling back. ({e})")
@@ -528,6 +529,10 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                     mm_aggregators = gemini_live.create_context_aggregator(mm_context)
                 except Exception:
                     mm_aggregators = LLMContextAggregatorPair(mm_context)
+                try:
+                    await gemini_live.set_context(mm_context)
+                except Exception:
+                    pass
                 pipeline = Pipeline(
                     [
                         transport.input(),
@@ -542,10 +547,13 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                 )
                 task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
                 runner = PipelineRunner()
-                multimodal_fallback_to_classic = {"value": False}
+                did_trigger_initial_run = {"value": False}
 
                 @transport.event_handler("on_client_connected")
                 async def _on_client_connected(_transport, _client):
+                    if did_trigger_initial_run["value"]:
+                        return
+                    did_trigger_initial_run["value"] = True
                     logger.info("Multimodal: client connected, triggering LLMRunFrame")
                     await task.queue_frames([LLMRunFrame()])
 
@@ -567,14 +575,12 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                             _MM["last_user_transcription_ts"] = None
                             await task.queue_frames(
                                 [
-                                    LLMMessagesAppendFrame(
-                                        [{"role": "user", "content": "رد بسرعة وباختصار."}],
-                                        run_llm=True,
-                                    )
+                                    LLMMessagesAppendFrame([{"role": "user", "content": "رد بسرعة وباختصار."}], run_llm=False),
+                                    LLMRunFrame(),
                                 ]
                             )
 
-                async def multimodal_silent_start_fallback():
+                async def multimodal_silent_start_retry():
                     timeout_s = 3.0
                     try:
                         timeout_s = float(os.getenv("MULTIMODAL_START_TIMEOUT_S") or 3.0)
@@ -582,15 +588,18 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                         timeout_s = 3.0
                     await asyncio.sleep(timeout_s)
                     if _MM.get("last_bot_started_ts") is None:
-                        multimodal_fallback_to_classic["value"] = True
-                        logger.warning("Multimodal: no bot audio detected, falling back to classic pipeline")
-                        await task.cancel()
+                        logger.warning("Multimodal: no bot audio detected, retrying LLMRunFrame")
+                        await task.queue_frames(
+                            [
+                                LLMMessagesAppendFrame([{"role": "user", "content": "احكي هسا بصوت واضح."}], run_llm=False),
+                                LLMRunFrame(),
+                            ]
+                        )
 
                 asyncio.create_task(multimodal_stuck_watchdog())
-                asyncio.create_task(multimodal_silent_start_fallback())
+                asyncio.create_task(multimodal_silent_start_retry())
                 await runner.run(task)
-                if not multimodal_fallback_to_classic["value"]:
-                    return
+                return
 
     stt_language = os.getenv("STT_LANGUAGE") or os.getenv("DEEPGRAM_LANGUAGE") or "ar"
     stt_language_enum = resolve_stt_language(stt_language)
@@ -670,6 +679,9 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
 
     # Initialize LLM with either path or credentials object
     llm_model = os.getenv("GOOGLE_VERTEX_MODEL") or "gemini-2.0-flash-001"
+    if "live" in llm_model:
+        logger.warning(f"Vertex model looks like a Live model ({llm_model}); falling back to gemini-2.0-flash-001.")
+        llm_model = "gemini-2.0-flash-001"
     logger.info(f"Using Vertex model: {llm_model}")
     llm_kwargs = {
         "project_id": os.getenv("GOOGLE_PROJECT_ID"),
