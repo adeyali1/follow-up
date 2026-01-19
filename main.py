@@ -250,7 +250,7 @@ async def webhook_route(request: Request):
                             "stream_track": "both_tracks",
                             "enable_dialogflow": False,
                             "stream_bidirectional_mode": "rtp",
-                            "stream_bidirectional_codec": "PCMA"
+                            "stream_bidirectional_codec": "L16"
                         }
                         async with session.post(fork_url, headers=headers, json=payload_data) as response:
                                 print(f"Fallback HTTP Status: {response.status}")
