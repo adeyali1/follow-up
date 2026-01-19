@@ -11,6 +11,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.google.llm_vertex import GoogleVertexLLMService
+from pipecat.services.google.stt import GoogleSTTService
 from pipecat.services.google.tts import GoogleTTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
@@ -76,6 +77,15 @@ def build_deepgram_live_options(*, encoding: str, sample_rate: int, language: st
     if utterance_end_ms is not None:
         live_options_kwargs["utterance_end_ms"] = utterance_end_ms
     return LiveOptions(**live_options_kwargs)
+
+
+def resolve_stt_language(language: str) -> Language:
+    normalized = (language or "").strip().lower()
+    if normalized.startswith("ar"):
+        return Language.AR
+    if normalized.startswith("en"):
+        return Language.EN
+    return Language.AR
 
 
 class STTPerf(FrameProcessor):
@@ -265,25 +275,56 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     # 1. Services
     vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.15, stop_secs=0.4, confidence=0.45))
     
-    deepgram_key = os.getenv("DEEPGRAM_API_KEY")
-    if not deepgram_key:
-        logger.error("CRITICAL: DEEPGRAM_API_KEY is missing in environment variables!")
-    else:
-        logger.info(f"Deepgram API Key found (len={len(deepgram_key)}).")
-
-    dg_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
-    logger.info(f"Initializing Deepgram with encoding: {dg_encoding} (inbound: {inbound_encoding})")
-
     stt_language = os.getenv("DEEPGRAM_LANGUAGE") or "ar"
-    stt_live_options = build_deepgram_live_options(
-        encoding=dg_encoding,
-        sample_rate=stream_sample_rate,
-        language=stt_language,
-    )
-    stt = DeepgramSTTService(
-        api_key=deepgram_key,
-        live_options=stt_live_options,
-    )
+    stt_provider_env = (os.getenv("STT_PROVIDER") or "").strip().lower()
+    stt_provider = stt_provider_env or ("google" if stt_language.lower().startswith("ar") else "deepgram")
+
+    if stt_provider == "deepgram" and stt_language.lower().startswith("ar"):
+        logger.warning("Deepgram streaming does not support Arabic. Switching STT provider to Google.")
+        stt_provider = "google"
+
+    if stt_provider == "deepgram":
+        deepgram_key = os.getenv("DEEPGRAM_API_KEY")
+        if not deepgram_key:
+            logger.error("CRITICAL: DEEPGRAM_API_KEY is missing in environment variables!")
+        else:
+            logger.info(f"Deepgram API Key found (len={len(deepgram_key)}).")
+
+        dg_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
+        logger.info(f"Initializing Deepgram with encoding: {dg_encoding} (inbound: {inbound_encoding})")
+
+        stt_live_options = build_deepgram_live_options(
+            encoding=dg_encoding,
+            sample_rate=stream_sample_rate,
+            language=stt_language,
+        )
+        stt = DeepgramSTTService(
+            api_key=deepgram_key,
+            live_options=stt_live_options,
+        )
+    else:
+        stt_language_enum = resolve_stt_language(stt_language)
+        stt_model = os.getenv("GOOGLE_STT_MODEL") or "latest_long"
+        stt_location = os.getenv("GOOGLE_STT_LOCATION") or "global"
+        logger.info(f"Using Google STT model: {stt_model} ({stt_location})")
+        stt_params = GoogleSTTService.InputParams(
+            languages=[stt_language_enum],
+            model=stt_model,
+            enable_automatic_punctuation=True,
+            enable_interim_results=True,
+            profanity_filter=False,
+            enable_voice_activity_events=False,
+        )
+        stt_kwargs = {
+            "sample_rate": stream_sample_rate,
+            "location": stt_location,
+            "params": stt_params,
+        }
+        if google_creds_str:
+            stt_kwargs["credentials"] = google_creds_str
+        else:
+            stt_kwargs["credentials_path"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        stt = GoogleSTTService(**stt_kwargs)
     
     # 2. Tools
     tools = [
