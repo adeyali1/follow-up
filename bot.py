@@ -38,7 +38,7 @@ from pipecat.audio.utils import create_stream_resampler
 _GOOGLE_TTS_VOICE_NAMES = None
 _PERF = {"last_user_text_ts": None, "last_llm_start_ts": None, "tts_first_audio_logged": False}
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None}
-BOT_BUILD_ID = "2026-01-20-multimodal-llmrunframe"
+BOT_BUILD_ID = "2026-01-20-multimodal-llmrunframe-FIXED"
 
 
 class STTPerf(FrameProcessor):
@@ -377,7 +377,9 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     
     use_smart_turn = (os.getenv("USE_SMART_TURN") or "true").strip().lower() in {"1", "true", "yes", "y"}
     vad_stop_secs = 0.2 if use_smart_turn else 0.4
-    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=vad_stop_secs, confidence=0.45))
+    
+    # --- FIX 1 APPLIED: Increased VAD sensitivity ---
+    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.6, start_secs=0.2, stop_secs=vad_stop_secs, confidence=0.7))
 
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
@@ -563,11 +565,12 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             await task.queue_frames([LLMRunFrame()])
 
         async def multimodal_stuck_watchdog():
-            timeout_s = 4.0
+            # --- FIX 2 APPLIED: Increased watchdog timeout ---
+            timeout_s = 10.0 # Increased from 4.0
             try:
-                timeout_s = float(os.getenv("MULTIMODAL_STUCK_TIMEOUT_S") or 4.0)
+                timeout_s = float(os.getenv("MULTIMODAL_STUCK_TIMEOUT_S") or 10.0)
             except Exception:
-                timeout_s = 4.0
+                timeout_s = 10.0
             while True:
                 await asyncio.sleep(0.5)
                 user_ts = _MM.get("last_user_transcription_ts")
@@ -586,11 +589,12 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                     )
 
         async def multimodal_silent_start_retry():
-            timeout_s = 3.0
+            # --- FIX 3 APPLIED: Increased silent start timeout ---
+            timeout_s = 6.0 # Increased from 3.0
             try:
-                timeout_s = float(os.getenv("MULTIMODAL_START_TIMEOUT_S") or 3.0)
+                timeout_s = float(os.getenv("MULTIMODAL_START_TIMEOUT_S") or 6.0)
             except Exception:
-                timeout_s = 3.0
+                timeout_s = 6.0
             max_retries = 3
             try:
                 max_retries = int(os.getenv("MULTIMODAL_MAX_START_RETRIES") or 3)
