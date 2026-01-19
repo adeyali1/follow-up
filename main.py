@@ -251,7 +251,7 @@ async def webhook_route(request: Request):
                             stream_codec = "PCMA"
                         payload_data = {
                             "stream_url": stream_url,
-                            "stream_track": "both_tracks",
+                            "stream_track": "inbound_track",
                             "enable_dialogflow": False,
                             "stream_bidirectional_mode": "rtp",
                             "stream_bidirectional_codec": stream_codec
