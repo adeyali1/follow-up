@@ -6,9 +6,9 @@ from loguru import logger
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
-from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator, LLMAssistantAggregator
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.frames.frames import LLMContextFrame, EndFrame, LLMRunFrame, LLMMessagesFrame, TTSSpeakFrame
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.google.llm_vertex import GoogleVertexLLMService
 from pipecat.services.google.tts import GoogleTTSService
@@ -16,6 +16,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, Fast
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
 from services.supabase_service import update_lead_status
 
 import json
@@ -293,70 +294,33 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
         {"role": "user", "content": "Start the conversation by greeting the customer."}
     ]
     context = LLMContext(messages=messages)
-    context_frame = LLMContextFrame(context)
 
-    # 5. Pipeline Phase 1: Greeting (Direct TTS - NO LLM)
-    # This guarantees the greeting is spoken immediately without LLM latency or triggering issues.
-    
-    pipeline_greeting = Pipeline([
-        tts,
-        transport.output()
-    ])
-
-    task_greeting = PipelineTask(pipeline_greeting)
-    
-    # 6. Pipeline Phase 2: Listening (STT + LLM Enabled)
-    # We enable STT only after the greeting is likely finished.
-    # Disable user turn strategies to prevent false interruptions from Telnyx comfort noise
-    user_agg = LLMUserAggregator(
+    aggregators = LLMContextAggregatorPair(
         context,
-        user_turn_start_strategy=None,
-        user_turn_stop_strategy=None
+        user_params=LLMUserAggregatorParams(
+            user_mute_strategies=[MuteUntilFirstBotCompleteUserMuteStrategy()]
+        ),
     )
-    assistant_agg_listening = LLMAssistantAggregator(context)
 
-    pipeline_listening = Pipeline([
+    pipeline = Pipeline([
         transport.input(),
         stt,
-        user_agg,
+        aggregators.user(),
         llm,
-        assistant_agg_listening,
         tts,
-        transport.output()
+        transport.output(),
+        aggregators.assistant(),
     ])
 
-    # Allow interruptions must be False to prevent Telnyx comfort noise from cancelling TTS
-    task_listening = PipelineTask(pipeline_listening, params=PipelineParams(allow_interruptions=False))
-    
+    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=False))
     runner = PipelineRunner()
-    
-    # Construct the greeting text from the lead data
-    greeting_text = f"Marhaba {lead_data.get('customer_name', 'Customer')}. Ana Kawkab AI from delivery service. Just confirming your order of {lead_data.get('order_items', 'items')}."
-    
-    logger.info("Starting Phase 1: Greeting (Direct TTS)...")
-    await task_greeting.queue_frames([TTSSpeakFrame(greeting_text)])
-    
-    # Run Phase 1 in background and wait for it to process
-    t1 = asyncio.create_task(runner.run(task_greeting))
-    
-    # Wait for greeting to be spoken (approx 4 seconds for a short greeting)
-    # Since we don't have a callback for "TTS finished", we use a safe delay.
-    await asyncio.sleep(4.0)
-    
-    # Cancel Phase 1 to switch to Phase 2
-    logger.info("Phase 1 complete. Switching to Phase 2: Listening...")
-    await task_greeting.cancel()
-    try:
-        await t1
-    except asyncio.CancelledError:
-        pass
 
-    # Run Phase 2
-    # We need to queue the context for Phase 2 so the LLM knows what happened
-    logger.info("Starting Phase 2: Listening (STT Enabled)...")
-    # Add the greeting to the context as if the assistant said it
-    messages.append({"role": "assistant", "content": greeting_text})
-    updated_context = LLMContext(messages=messages)
-    await task_listening.queue_frames([LLMContextFrame(updated_context)])
-    
-    await runner.run(task_listening)
+    customer_name = lead_data.get("customer_name") or "العميل"
+    order_items = lead_data.get("order_items") or ""
+    delivery_time = lead_data.get("delivery_time") or ""
+    greeting_text = f"مرحبا {customer_name}. أنا كوكب، مساعد التوصيل. للتأكيد، طلبك {order_items} وموعد التوصيل {delivery_time}. بتأكد الطلب؟"
+
+    logger.info(f"Queuing greeting (inbound_encoding={inbound_encoding}, tts_encoding={tts_encoding})")
+    await task.queue_frames([TTSSpeakFrame(greeting_text)])
+    logger.info("Starting single pipeline run")
+    await runner.run(task)
