@@ -8,7 +8,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator, LLMAssistantAggregator
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.frames.frames import LLMContextFrame, EndFrame, LLMMessagesFrame
+from pipecat.frames.frames import LLMContextFrame, EndFrame, LLMRunFrame, LLMMessagesFrame
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.google.llm_vertex import GoogleVertexLLMService
 from pipecat.services.google.tts import GoogleTTSService
@@ -334,7 +334,7 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     runner = PipelineRunner()
     
     logger.info("Starting Phase 1: Greeting (No STT)...")
-    await task_greeting.queue_frames([context_frame])
+    await task_greeting.queue_frames([context_frame, LLMRunFrame()])
     
     # Run Phase 1 in background and wait for it to process
     t1 = asyncio.create_task(runner.run(task_greeting))
