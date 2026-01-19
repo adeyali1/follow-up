@@ -209,11 +209,11 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     llm = GoogleVertexLLMService(**llm_kwargs)
     
-    # Initialize TTS
+    tts_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
     tts_kwargs = {
         "voice_id": "ar-JO-Standard-A",
         "sample_rate": 8000,
-        "encoding": "alaw"
+        "encoding": tts_encoding
     }
     if google_creds_obj:
         tts_kwargs["credentials"] = google_creds_obj
@@ -256,8 +256,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         stream_id=stream_id, # Captured from handshake
         call_control_id=call_control_id,
         api_key=os.getenv("TELNYX_API_KEY"),
-        outbound_encoding="PCMA", # Force PCMA for Jordan
-        inbound_encoding="PCMA", # Force PCMA for Jordan
+        outbound_encoding=inbound_encoding,
+        inbound_encoding=inbound_encoding,
         params=TelnyxFrameSerializer.InputParams(
             sample_rate=8000
         )
@@ -334,7 +334,7 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     runner = PipelineRunner()
     
     logger.info("Starting Phase 1: Greeting (No STT)...")
-    await task_greeting.queue_frames([context_frame, LLMContextFrame(context)])
+    await task_greeting.queue_frames([context_frame])
     
     # Run Phase 1 in background and wait for it to process
     t1 = asyncio.create_task(runner.run(task_greeting))
