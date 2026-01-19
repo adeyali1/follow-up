@@ -116,6 +116,15 @@ def normalize_gemini_live_model_name(model: str) -> str:
     return f"models/{model}"
 
 
+def build_multimodal_opening_message(greeting_text: str) -> str:
+    greeting_text = (greeting_text or "").strip()
+    return (
+        "ابدأ المكالمة هلّق. أول جملة تحكيها لازم تكون EXACTLY هالنص بدون أي تغيير:\n"
+        f"\"{greeting_text}\"\n"
+        "بعدها اسأل سؤال واحد قصير للتأكيد وبس."
+    )
+
+
 def build_deepgram_live_options(*, encoding: str, sample_rate: int, language: str) -> LiveOptions:
     language = (language or "ar").strip()
     model = (os.getenv("DEEPGRAM_MODEL") or "").strip() or None
@@ -436,18 +445,12 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             except Exception:
                 gemini_in_sample_rate = 16000
 
-            model = normalize_gemini_live_model_name(os.getenv("GEMINI_LIVE_MODEL") or "gemini-2.0-flash-exp")
+            model = normalize_gemini_live_model_name(os.getenv("GEMINI_LIVE_MODEL") or "gemini-2.0-flash-live-001")
             voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Charon").strip()
-            try:
-                from pipecat.services.gemini_multimodal_live.gemini import (
-                    GeminiMultimodalLiveLLMService as GeminiLiveService,
-                    InputParams as GeminiLiveInputParams,
-                )
-            except Exception:
-                from pipecat.services.google.gemini_live.llm import (
-                    GeminiLiveLLMService as GeminiLiveService,
-                    InputParams as GeminiLiveInputParams,
-                )
+            from pipecat.services.google.gemini_live.llm import (
+                GeminiLiveLLMService as GeminiLiveService,
+                InputParams as GeminiLiveInputParams,
+            )
 
             gemini_params = GeminiLiveInputParams(temperature=0.3)
             try:
@@ -462,13 +465,20 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                 gemini_params.mime_type = "audio/pcm"
             except Exception:
                 pass
-            gemini_live = GeminiLiveService(
-                api_key=api_key,
-                model=model,
-                voice_id=voice_id,
-                system_instruction=system_prompt,
-                params=gemini_params,
+            logger.info(
+                f"GeminiLive mode enabled (model={model}, voice={voice_id}, in_sr={gemini_in_sample_rate}, out_sr={stream_sample_rate})"
             )
+            try:
+                gemini_live = GeminiLiveService(
+                    api_key=api_key,
+                    model=model,
+                    voice_id=voice_id,
+                    system_instruction=system_prompt,
+                    params=gemini_params,
+                )
+            except Exception as e:
+                logger.error(f"GeminiLive init failed; falling back. ({e})")
+                gemini_live = None
 
             call_end_delay_s = 2.5
             try:
@@ -500,47 +510,50 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                 if call_control_id:
                     asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
 
-            gemini_live.register_function("update_lead_status_confirmed", confirm_order)
-            gemini_live.register_function("update_lead_status_cancelled", cancel_order)
+            if gemini_live is not None:
+                gemini_live.register_function("update_lead_status_confirmed", confirm_order)
+                gemini_live.register_function("update_lead_status_cancelled", cancel_order)
 
             resampler = AudioSampleRateResampler(
                 target_input_sample_rate=gemini_in_sample_rate,
                 target_output_sample_rate=stream_sample_rate,
             )
             mm_perf = MultimodalPerf()
-            pipeline = Pipeline([transport.input(), resampler, gemini_live, mm_perf, resampler, transport.output()])
-            task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
-            runner = PipelineRunner()
+            if gemini_live is not None:
+                pipeline = Pipeline([transport.input(), resampler, gemini_live, mm_perf, resampler, transport.output()])
+                task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+                runner = PipelineRunner()
 
-            async def multimodal_stuck_watchdog():
-                timeout_s = 4.0
-                try:
-                    timeout_s = float(os.getenv("MULTIMODAL_STUCK_TIMEOUT_S") or 4.0)
-                except Exception:
+                async def multimodal_stuck_watchdog():
                     timeout_s = 4.0
-                while True:
-                    await asyncio.sleep(0.5)
-                    user_ts = _MM.get("last_user_transcription_ts")
-                    bot_ts = _MM.get("last_bot_started_ts")
-                    if user_ts is None:
-                        continue
-                    if bot_ts is not None and bot_ts > user_ts:
-                        continue
-                    if time.monotonic() - user_ts >= timeout_s:
-                        _MM["last_user_transcription_ts"] = None
-                        await task.queue_frames(
-                            [
-                                LLMMessagesAppendFrame(
-                                    [{"role": "user", "content": "رد بسرعة وباختصار."}],
-                                    run_llm=True,
-                                )
-                            ]
-                        )
+                    try:
+                        timeout_s = float(os.getenv("MULTIMODAL_STUCK_TIMEOUT_S") or 4.0)
+                    except Exception:
+                        timeout_s = 4.0
+                    while True:
+                        await asyncio.sleep(0.5)
+                        user_ts = _MM.get("last_user_transcription_ts")
+                        bot_ts = _MM.get("last_bot_started_ts")
+                        if user_ts is None:
+                            continue
+                        if bot_ts is not None and bot_ts > user_ts:
+                            continue
+                        if time.monotonic() - user_ts >= timeout_s:
+                            _MM["last_user_transcription_ts"] = None
+                            await task.queue_frames(
+                                [
+                                    LLMMessagesAppendFrame(
+                                        [{"role": "user", "content": "رد بسرعة وباختصار."}],
+                                        run_llm=True,
+                                    )
+                                ]
+                            )
 
-            asyncio.create_task(multimodal_stuck_watchdog())
-            await task.queue_frames([LLMMessagesAppendFrame([{"role": "user", "content": greeting_text}], run_llm=True)])
-            await runner.run(task)
-            return
+                asyncio.create_task(multimodal_stuck_watchdog())
+                opening_message = build_multimodal_opening_message(greeting_text)
+                await task.queue_frames([LLMMessagesAppendFrame([{"role": "user", "content": opening_message}], run_llm=True)])
+                await runner.run(task)
+                return
 
     stt_language = os.getenv("STT_LANGUAGE") or os.getenv("DEEPGRAM_LANGUAGE") or "ar"
     stt_language_enum = resolve_stt_language(stt_language)
