@@ -168,32 +168,36 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     # 2. Tools
     tools = [
         {
-            "name": "update_lead_status_confirmed",
-            "description": "Call this when the customer confirms the order.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reason": {"type": "string", "description": "Reason for confirmation"}
+            "function_declarations": [
+                {
+                    "name": "update_lead_status_confirmed",
+                    "description": "Call this when the customer confirms the order.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {"type": "string", "description": "Reason for confirmation"}
+                        },
+                    },
                 },
-            },
-        },
-        {
-            "name": "update_lead_status_cancelled",
-            "description": "Call this when the customer cancels the order.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reason": {"type": "string", "description": "Reason for cancellation"}
+                {
+                    "name": "update_lead_status_cancelled",
+                    "description": "Call this when the customer cancels the order.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {"type": "string", "description": "Reason for cancellation"}
+                        },
+                    },
                 },
-            },
-        },
+            ]
+        }
     ]
 
     # Initialize LLM with either path or credentials object
     llm_kwargs = {
         "project_id": os.getenv("GOOGLE_PROJECT_ID"),
         "location": "us-central1",
-        "model": "gemini-2.0-flash-lite-preview-02-05",
+        "model": "gemini-2.5-flash-lite",
         "tools": tools
     }
     
