@@ -16,15 +16,54 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, Fast
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.frames.frames import TranscriptionFrame, LLMFullResponseStartFrame, TTSAudioRawFrame
 from pipecat.transcriptions.language import Language
 from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy
 from services.supabase_service import update_lead_status
 
 import json
+import time
 from google.oauth2 import service_account
 from google.cloud import texttospeech_v1
 
 _GOOGLE_TTS_VOICE_NAMES = None
+_PERF = {"last_user_text_ts": None, "last_llm_start_ts": None, "tts_first_audio_logged": False}
+
+
+class STTPerf(FrameProcessor):
+    async def process_frame(self, frame, direction):
+        if isinstance(frame, TranscriptionFrame):
+            _PERF["last_user_text_ts"] = time.monotonic()
+            _PERF["last_llm_start_ts"] = None
+            _PERF["tts_first_audio_logged"] = False
+        await self.push_frame(frame, direction)
+
+
+class LLMPerf(FrameProcessor):
+    async def process_frame(self, frame, direction):
+        if isinstance(frame, LLMFullResponseStartFrame):
+            now = time.monotonic()
+            _PERF["last_llm_start_ts"] = now
+            user_ts = _PERF.get("last_user_text_ts")
+            if user_ts is not None:
+                logger.info(f"Latency user_text→llm_start={now - user_ts:.3f}s")
+        await self.push_frame(frame, direction)
+
+
+class TTSPerf(FrameProcessor):
+    async def process_frame(self, frame, direction):
+        if isinstance(frame, TTSAudioRawFrame) and not _PERF.get("tts_first_audio_logged"):
+            now = time.monotonic()
+            llm_ts = _PERF.get("last_llm_start_ts")
+            user_ts = _PERF.get("last_user_text_ts")
+            if llm_ts is not None:
+                logger.info(f"Latency llm_start→tts_audio={now - llm_ts:.3f}s")
+            if user_ts is not None:
+                logger.info(f"Latency user_text→tts_audio={now - user_ts:.3f}s")
+            _PERF["tts_first_audio_logged"] = True
+        await self.push_frame(frame, direction)
 
 # Helper function to get Google Credentials
 def get_google_credentials():
@@ -76,7 +115,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     # 0. Handle Telnyx Handshake to get stream_id
     stream_id = "telnyx_stream_placeholder"
-    inbound_encoding = "PCMU" # Default to PCMU (G.711u)
+    inbound_encoding = "PCMU"
+    stream_sample_rate = 8000
     try:
         # Telnyx typically sends a JSON payload first with event="connected"
         # Then it sends event="start" which contains the stream_id
@@ -92,6 +132,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             # Check if this message has media_format information (usually in 'start' event)
             if "media_format" in msg:
                  encoding = msg["media_format"].get("encoding", "").upper()
+                 stream_sample_rate = int(msg["media_format"].get("sample_rate", stream_sample_rate) or stream_sample_rate)
                  logger.info(f"Telnyx Media Format (direct): {msg['media_format']}")
                  if encoding == "G729":
                      logger.error("CRITICAL: Telnyx is sending G.729 audio. Pipecat requires PCMU (G.711u) or PCMA (G.711a).")
@@ -101,9 +142,12 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                      inbound_encoding = "PCMA"
                  elif encoding == "PCMU":
                      inbound_encoding = "PCMU"
+                 elif encoding == "L16":
+                     inbound_encoding = "L16"
 
             elif "start" in msg and "media_format" in msg["start"]:
                  encoding = msg["start"]["media_format"].get("encoding", "").upper()
+                 stream_sample_rate = int(msg["start"]["media_format"].get("sample_rate", stream_sample_rate) or stream_sample_rate)
                  logger.info(f"Telnyx Media Format (nested in start): {msg['start']['media_format']}")
                  if encoding == "G729":
                      logger.error("CRITICAL: Telnyx is sending G.729 audio. Pipecat requires PCMU (G.711u) or PCMA (G.711a).")
@@ -113,6 +157,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                      inbound_encoding = "PCMA"
                  elif encoding == "PCMU":
                      inbound_encoding = "PCMU"
+                 elif encoding == "L16":
+                     inbound_encoding = "L16"
 
             # Check standard locations for stream_id
             if "stream_id" in msg:
@@ -152,7 +198,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         google_creds_obj = service_account.Credentials.from_service_account_info(google_creds_dict)
     
     # 1. Services
-    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=0.4, confidence=0.5))
+    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.15, stop_secs=0.25, confidence=0.45))
     
     deepgram_key = os.getenv("DEEPGRAM_API_KEY")
     if not deepgram_key:
@@ -167,7 +213,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         api_key=deepgram_key,
         model="nova-2",
         language="ar",
-        sample_rate=8000,
+        sample_rate=stream_sample_rate,
         encoding=dg_encoding
     )
     
@@ -215,6 +261,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     llm = GoogleVertexLLMService(**llm_kwargs)
     
     tts_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
+    tts_sample_rate = stream_sample_rate
     voice_id = os.getenv("GOOGLE_TTS_VOICE_ID") or "ar-XA-Chirp3-HD-Charon"
     fallback_voice_id = "ar-XA-Chirp3-HD-Charon"
     global _GOOGLE_TTS_VOICE_NAMES
@@ -239,11 +286,20 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         if voice_id.startswith("ar-JO"):
             logger.warning(f"Google TTS voice {voice_id} likely invalid. Falling back to {fallback_voice_id}. ({e})")
             voice_id = fallback_voice_id
+    speaking_rate = None
+    try:
+        speaking_rate_env = os.getenv("GOOGLE_TTS_SPEAKING_RATE")
+        if speaking_rate_env:
+            speaking_rate = float(speaking_rate_env)
+        else:
+            speaking_rate = 1.15
+    except Exception:
+        speaking_rate = 1.15
     tts_kwargs = {
         "voice_id": voice_id,
-        "sample_rate": 8000,
+        "sample_rate": tts_sample_rate,
         "encoding": tts_encoding,
-        "params": GoogleTTSService.InputParams(language=Language.AR)
+        "params": GoogleTTSService.InputParams(language=Language.AR, speaking_rate=speaking_rate)
     }
     if google_creds_obj:
         tts_kwargs["credentials"] = google_creds_obj
@@ -289,7 +345,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         outbound_encoding=inbound_encoding,
         inbound_encoding=inbound_encoding,
         params=TelnyxFrameSerializer.InputParams(
-            sample_rate=8000
+            sample_rate=stream_sample_rate
         )
     )
     
@@ -303,17 +359,29 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             vad_analyzer=vad,
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000
+            audio_in_sample_rate=stream_sample_rate,
+            audio_out_sample_rate=stream_sample_rate
         )
     )
 
     # 4. Prompt
-    system_prompt = f"""You are Kawkab AI, a delivery assistant. Speak in Jordanian Arabic.
-Greet {lead_data['customer_name']}. Confirm they ordered {lead_data['order_items']} for delivery at {lead_data['delivery_time']}.
-If confirmed, call tool update_lead_status_confirmed().
-If cancelled, call tool update_lead_status_cancelled().
-If no answer or voicemail, just hang up (I will handle this via timeout or silence).
+    system_prompt = f"""أنت \"كوكب\" مساعد تأكيد طلبات للتوصيل في الأردن. احكي عامية أردنية طبيعية وبأسلوب ودود.
+خليك مختصر: جُمل قصيرة وما تطوّل.
+
+معلومات الطلب:
+- الاسم: {lead_data['customer_name']}
+- الطلب: {lead_data['order_items']}
+- وقت التوصيل: {lead_data['delivery_time']}
+
+الهدف:
+1) اسأل سؤال تأكيد واضح: هل بتأكد الطلب؟
+2) إذا أكّد: نادِ الدالة update_lead_status_confirmed(reason=...).
+3) إذا لغى: نادِ الدالة update_lead_status_cancelled(reason=...).
+4) إذا الجواب مش واضح: اسأل سؤال واحد توضيحي وبس.
+
+قواعد اللغة:
+- لا تحكي إنجليزي إلا إذا العميل حكى إنجليزي.
+- خلي أسماء المنتجات/الأسماء زي ما هي بدون تعريب مبالغ فيه.
 """
 
     # 4. Prompt & Context
@@ -324,30 +392,44 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     ]
     context = LLMContext(messages=messages)
 
+    user_turn_strategies = UserTurnStrategies(
+        start=[TranscriptionUserTurnStartStrategy(use_interim=False)],
+        stop=[TranscriptionUserTurnStopStrategy(timeout=0.35)],
+    )
+
     aggregators = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            user_mute_strategies=[MuteUntilFirstBotCompleteUserMuteStrategy()]
+            user_turn_strategies=user_turn_strategies,
+            user_mute_strategies=[MuteUntilFirstBotCompleteUserMuteStrategy()],
+            user_turn_stop_timeout=1.5,
         ),
     )
+
+    stt_perf = STTPerf()
+    llm_perf = LLMPerf()
+    tts_perf = TTSPerf()
 
     pipeline = Pipeline([
         transport.input(),
         stt,
+        stt_perf,
         aggregators.user(),
         llm,
+        llm_perf,
         tts,
+        tts_perf,
         transport.output(),
         aggregators.assistant(),
     ])
 
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=False))
+    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
     runner = PipelineRunner()
 
     customer_name = lead_data.get("customer_name") or "العميل"
     order_items = lead_data.get("order_items") or ""
     delivery_time = lead_data.get("delivery_time") or ""
-    greeting_text = f"مرحبا {customer_name}. أنا كوكب، مساعد التوصيل. للتأكيد، طلبك {order_items} وموعد التوصيل {delivery_time}. بتأكد الطلب؟"
+    greeting_text = f"مرحبا يا {customer_name}، معك كوكب من التوصيل. طلبك {order_items} للساعة {delivery_time}. بتأكد؟"
 
     logger.info(f"Queuing greeting (inbound_encoding={inbound_encoding}, tts_encoding={tts_encoding})")
     await task.queue_frames([TTSSpeakFrame(greeting_text)])
