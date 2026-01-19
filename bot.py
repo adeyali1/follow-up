@@ -455,6 +455,10 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             GeminiLiveLLMService as GeminiLiveService,
             InputParams as GeminiLiveInputParams,
         )
+        try:
+            from pipecat.services.google.gemini_live.llm import GeminiModalities
+        except Exception:
+            GeminiModalities = None
 
         gemini_params = GeminiLiveInputParams(temperature=0.3)
         gemini_language_env = (os.getenv("GEMINI_LIVE_LANGUAGE") or "").strip()
@@ -474,8 +478,18 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             gemini_params.mime_type = "audio/pcm"
         except Exception:
             pass
+        try:
+            if GeminiModalities is not None:
+                gemini_params.modalities = GeminiModalities.AUDIO
+        except Exception:
+            pass
+        modality_label = "DEFAULT"
+        try:
+            modality_label = str(getattr(gemini_params, "modalities", None) or "DEFAULT")
+        except Exception:
+            modality_label = "DEFAULT"
         logger.info(
-            f"GeminiLive mode enabled (model={model or 'DEFAULT'}, voice={voice_id}, in_sr={gemini_in_sample_rate}, out_sr={stream_sample_rate})"
+            f"GeminiLive mode enabled (model={model or 'DEFAULT'}, voice={voice_id}, modalities={modality_label}, in_sr={gemini_in_sample_rate}, out_sr={stream_sample_rate})"
         )
         try:
             gemini_kwargs = {
@@ -537,10 +551,17 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
 
         opening_message = build_multimodal_opening_message(greeting_text)
         mm_context = LLMContext(messages=[{"role": "user", "content": opening_message}])
+        user_mute_strategies = []
         try:
-            mm_aggregators = gemini_live.create_context_aggregator(mm_context)
+            from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
+
+            user_mute_strategies.append(MuteUntilFirstBotCompleteUserMuteStrategy())
         except Exception:
-            mm_aggregators = LLMContextAggregatorPair(mm_context)
+            pass
+        mm_aggregators = LLMContextAggregatorPair(
+            mm_context,
+            user_params=LLMUserAggregatorParams(user_mute_strategies=user_mute_strategies),
+        )
         try:
             maybe_coro = gemini_live.set_context(mm_context)
             if asyncio.iscoroutine(maybe_coro):
