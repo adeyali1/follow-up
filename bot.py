@@ -213,7 +213,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     tts_kwargs = {
         "voice_id": "ar-JO-Standard-A",
         "sample_rate": 8000,
-        "encoding": "linear16"
+        "encoding": "alaw"
     }
     if google_creds_obj:
         tts_kwargs["credentials"] = google_creds_obj
