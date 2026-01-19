@@ -8,7 +8,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator, LLMAssistantAggregator
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.frames.frames import LLMContextFrame, EndFrame, LLMRunFrame, LLMMessagesFrame
+from pipecat.frames.frames import LLMContextFrame, EndFrame, LLMRunFrame, LLMMessagesFrame, TTSSpeakFrame
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.google.llm_vertex import GoogleVertexLLMService
 from pipecat.services.google.tts import GoogleTTSService
@@ -295,20 +295,17 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     context = LLMContext(messages=messages)
     context_frame = LLMContextFrame(context)
 
-    # 5. Pipeline Phase 1: Greeting (NO STT)
-    # This guarantees the greeting is spoken before any audio input can trigger interruptions.
-    assistant_agg = LLMAssistantAggregator(context)
+    # 5. Pipeline Phase 1: Greeting (Direct TTS - NO LLM)
+    # This guarantees the greeting is spoken immediately without LLM latency or triggering issues.
     
     pipeline_greeting = Pipeline([
-        llm,
-        assistant_agg,
         tts,
         transport.output()
     ])
 
     task_greeting = PipelineTask(pipeline_greeting)
     
-    # 6. Pipeline Phase 2: Listening (STT Enabled)
+    # 6. Pipeline Phase 2: Listening (STT + LLM Enabled)
     # We enable STT only after the greeting is likely finished.
     # Disable user turn strategies to prevent false interruptions from Telnyx comfort noise
     user_agg = LLMUserAggregator(
@@ -333,8 +330,11 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     
     runner = PipelineRunner()
     
-    logger.info("Starting Phase 1: Greeting (No STT)...")
-    await task_greeting.queue_frames([context_frame, LLMRunFrame()])
+    # Construct the greeting text from the lead data
+    greeting_text = f"Marhaba {lead_data.get('customer_name', 'Customer')}. Ana Kawkab AI from delivery service. Just confirming your order of {lead_data.get('order_items', 'items')}."
+    
+    logger.info("Starting Phase 1: Greeting (Direct TTS)...")
+    await task_greeting.queue_frames([TTSSpeakFrame(greeting_text)])
     
     # Run Phase 1 in background and wait for it to process
     t1 = asyncio.create_task(runner.run(task_greeting))
@@ -352,5 +352,11 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
         pass
 
     # Run Phase 2
+    # We need to queue the context for Phase 2 so the LLM knows what happened
     logger.info("Starting Phase 2: Listening (STT Enabled)...")
+    # Add the greeting to the context as if the assistant said it
+    messages.append({"role": "assistant", "content": greeting_text})
+    updated_context = LLMContext(messages=messages)
+    await task_listening.queue_frames([LLMContextFrame(updated_context)])
+    
     await runner.run(task_listening)
