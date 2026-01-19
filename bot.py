@@ -210,7 +210,9 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     
     # Initialize TTS
     tts_kwargs = {
-        "voice_id": "ar-JO-Standard-A"
+        "voice_id": "ar-JO-Standard-A",
+        "sample_rate": 8000,
+        "encoding": "linear16"
     }
     if google_creds_obj:
         tts_kwargs["credentials"] = google_creds_obj
@@ -306,7 +308,7 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
         transport.output()
     ])
 
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=False))
+    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
     
     runner = PipelineRunner()
     
