@@ -26,6 +26,7 @@ from services.supabase_service import update_lead_status
 
 import json
 import time
+import aiohttp
 from deepgram import LiveOptions
 from google.oauth2 import service_account
 from google.cloud import texttospeech_v1
@@ -86,6 +87,27 @@ def resolve_stt_language(language: str) -> Language:
     if normalized.startswith("en"):
         return Language.EN
     return Language.AR
+
+
+async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
+    if not call_control_id:
+        return
+    telnyx_key = os.getenv("TELNYX_API_KEY")
+    if not telnyx_key:
+        logger.warning("TELNYX_API_KEY missing; cannot hang up call.")
+        return
+    if delay_s > 0:
+        await asyncio.sleep(delay_s)
+    url = f"https://api.telnyx.com/v2/calls/{call_control_id}/actions/hangup"
+    headers = {"Authorization": f"Bearer {telnyx_key}", "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json={"reason": "normal_clearing"}) as resp:
+                if resp.status >= 300:
+                    text = await resp.text()
+                    logger.warning(f"Telnyx hangup failed: {resp.status} {text}")
+    except Exception as e:
+        logger.warning(f"Telnyx hangup exception: {e}")
 
 
 class STTPerf(FrameProcessor):
@@ -274,6 +296,11 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     
     # 1. Services
     vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.15, stop_secs=0.4, confidence=0.45))
+    call_end_delay_s = 2.5
+    try:
+        call_end_delay_s = float(os.getenv("CALL_END_DELAY_S") or 2.5)
+    except Exception:
+        call_end_delay_s = 2.5
     
     stt_language = os.getenv("DEEPGRAM_LANGUAGE") or "ar"
     stt_provider_env = (os.getenv("STT_PROVIDER") or "").strip().lower()
@@ -433,11 +460,19 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         logger.info(f"Confirming order for lead {lead_data['id']}")
         update_lead_status(lead_data['id'], 'CONFIRMED')
         await result_callback("Order confirmed successfully.")
+        if call_control_id:
+            asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
+        else:
+            logger.warning("No call_control_id; cannot hang up after confirmation.")
 
     async def cancel_order(function_name, tool_call_id, args, llm, context, result_callback):
         logger.info(f"Cancelling order for lead {lead_data['id']}")
         update_lead_status(lead_data['id'], 'CANCELLED')
         await result_callback("Order cancelled.")
+        if call_control_id:
+            asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
+        else:
+            logger.warning("No call_control_id; cannot hang up after cancellation.")
 
     llm.register_function(
         "update_lead_status_confirmed",
@@ -505,6 +540,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 - استخدم: \"ليش\" بدل \"لماذا\"، و\"هون\" بدل \"هنا\"، و\"عشان هيك\" بدل \"لهيك\".
 - استخدم تعبيرات خفيفة وطبيعية حسب السياق: \"تمام\"، \"مية مية\"، \"يا هلا والله\" بدون مبالغة.
 - إذا العميل قال \"Hello\" أو \"Are you there\" أو \"ألو\" أو \"وينك\" أو \"معك؟\": رد مرة واحدة \"معك معك، تفضل\" وارجع مباشرةً للمهمة بدون ما تعيد التحية.
+- بعد التأكيد أو الإلغاء، احكي جملة ختامية قصيرة وبس وما تسأل أي سؤال إضافي.
 """
 
     # 4. Prompt & Context
