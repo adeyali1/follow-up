@@ -2,6 +2,9 @@ import os
 import sys
 import ast
 import asyncio
+import re
+import aiohttp
+from urllib.parse import quote
 from loguru import logger
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -13,101 +16,25 @@ from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.google.llm_vertex import GoogleVertexLLMService
 from pipecat.services.google.stt import GoogleSTTService
 from pipecat.services.google.tts import GoogleTTSService
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.frames.frames import EndFrame, ErrorFrame, TranscriptionFrame, LLMFullResponseStartFrame, TTSAudioRawFrame
+from pipecat.frames.frames import TranscriptionFrame, LLMFullResponseStartFrame, TTSAudioRawFrame
 from pipecat.transcriptions.language import Language
-from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy
 from services.supabase_service import update_lead_status
 
 import json
 import time
-import aiohttp
-from deepgram import LiveOptions
 from google.oauth2 import service_account
 from google.cloud import texttospeech_v1
+from deepgram import LiveOptions
 
 _GOOGLE_TTS_VOICE_NAMES = None
 _PERF = {"last_user_text_ts": None, "last_llm_start_ts": None, "tts_first_audio_logged": False}
-
-
-def build_deepgram_live_options(*, encoding: str, sample_rate: int, language: str) -> LiveOptions:
-    language = (language or "ar").strip()
-    model = (os.getenv("DEEPGRAM_MODEL") or "").strip() or None
-    if not model:
-        model = "nova-2-phonecall" if language.startswith("en") else "nova-2"
-
-    smart_format = (os.getenv("DEEPGRAM_SMART_FORMAT") or "true").strip().lower() in {"1", "true", "yes", "y"}
-    punctuate = (os.getenv("DEEPGRAM_PUNCTUATE") or "false").strip().lower() in {"1", "true", "yes", "y"}
-    profanity_filter = (os.getenv("DEEPGRAM_PROFANITY_FILTER") or "false").strip().lower() in {"1", "true", "yes", "y"}
-
-    utterance_end_ms = "1000"
-    utterance_end_ms_env = (os.getenv("DEEPGRAM_UTTERANCE_END_MS") or "").strip()
-    if utterance_end_ms_env:
-        if utterance_end_ms_env.lower() in {"0", "false", "off", "none", "null"}:
-            utterance_end_ms = None
-        else:
-            try:
-                utterance_end_ms_int = int(float(utterance_end_ms_env))
-                utterance_end_ms = str(utterance_end_ms_int)
-            except Exception:
-                utterance_end_ms = "1000"
-
-    logger.info(
-        f"Deepgram options: model={model} language={language} encoding={encoding} sample_rate={sample_rate} "
-        f"smart_format={smart_format} punctuate={punctuate} profanity_filter={profanity_filter} "
-        f"utterance_end_ms={utterance_end_ms}"
-    )
-
-    live_options_kwargs = dict(
-        encoding=encoding,
-        language=language,
-        model=model,
-        channels=1,
-        sample_rate=sample_rate,
-        interim_results=True,
-        smart_format=smart_format,
-        punctuate=punctuate,
-        profanity_filter=profanity_filter,
-        vad_events=False,
-    )
-    if utterance_end_ms is not None:
-        live_options_kwargs["utterance_end_ms"] = utterance_end_ms
-    return LiveOptions(**live_options_kwargs)
-
-
-def resolve_stt_language(language: str) -> Language:
-    normalized = (language or "").strip().lower()
-    if normalized.startswith("ar"):
-        return Language.AR
-    if normalized.startswith("en"):
-        return Language.EN
-    return Language.AR
-
-
-async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
-    if not call_control_id:
-        return
-    telnyx_key = os.getenv("TELNYX_API_KEY")
-    if not telnyx_key:
-        logger.warning("TELNYX_API_KEY missing; cannot hang up call.")
-        return
-    if delay_s > 0:
-        await asyncio.sleep(delay_s)
-    url = f"https://api.telnyx.com/v2/calls/{call_control_id}/actions/hangup"
-    headers = {"Authorization": f"Bearer {telnyx_key}", "Content-Type": "application/json"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json={"reason": "normal_clearing"}) as resp:
-                if resp.status >= 300:
-                    text = await resp.text()
-                    logger.warning(f"Telnyx hangup failed: {resp.status} {text}")
-    except Exception as e:
-        logger.warning(f"Telnyx hangup exception: {e}")
 
 
 class STTPerf(FrameProcessor):
@@ -147,20 +74,101 @@ class TTSPerf(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-class STTFailureFallback(FrameProcessor):
-    def __init__(self):
-        super().__init__()
-        self._handled = False
+def resolve_stt_language(language: str) -> Language:
+    normalized = (language or "").strip().lower()
+    if normalized.startswith("ar"):
+        return Language.AR
+    if normalized.startswith("en"):
+        return Language.EN
+    return Language.AR
 
+
+def build_deepgram_live_options(*, encoding: str, sample_rate: int, language: str) -> LiveOptions:
+    language = (language or "ar").strip()
+    model = (os.getenv("DEEPGRAM_MODEL") or "").strip() or None
+    if not model:
+        model = "nova-2-phonecall" if language.startswith("en") else "nova-2"
+
+    utterance_end_ms = "1000"
+    utterance_end_ms_env = (os.getenv("DEEPGRAM_UTTERANCE_END_MS") or "").strip()
+    if utterance_end_ms_env:
+        try:
+            utterance_end_ms = str(int(float(utterance_end_ms_env)))
+        except Exception:
+            utterance_end_ms = "1000"
+
+    return LiveOptions(
+        encoding=encoding,
+        language=language,
+        model=model,
+        channels=1,
+        sample_rate=sample_rate,
+        interim_results=True,
+        smart_format=True,
+        punctuate=False,
+        profanity_filter=False,
+        vad_events=False,
+        utterance_end_ms=utterance_end_ms,
+    )
+
+
+def normalize_jordanian_text(text: str) -> str:
+    if not text:
+        return text
+    replacements = {
+        "السائق": "الشوفير",
+        "الآن": "هسا",
+        "سوف": "رح",
+        "ماذا": "شو",
+        "لماذا": "ليش",
+        "تريد": "بدك",
+        "أريد": "بدي",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    return text
+
+
+def should_drop_tts_text(text: str) -> bool:
+    if text is None:
+        return True
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return re.fullmatch(r"[\.\,\!\?\u061F\u060C\u060D\u061B\u066A-\u066C\u06D4]+", stripped) is not None
+
+
+class JordanianTTSPreprocessor(FrameProcessor):
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
-        if isinstance(frame, ErrorFrame) and not self._handled:
-            error_text = str(getattr(frame, "error", ""))
-            if "Unable to connect to Deepgram" in error_text:
-                self._handled = True
-                await self.push_frame(TTSSpeakFrame("صار في مشكلة بالصوت، معك حق. لحظة وبنرجع."), direction)
-                await self.push_frame(EndFrame(), direction)
+        if isinstance(frame, TTSSpeakFrame):
+            text = getattr(frame, "text", None)
+            if isinstance(text, str):
+                text = normalize_jordanian_text(text)
+                if should_drop_tts_text(text):
+                    return
+                frame.text = text
         await self.push_frame(frame, direction)
+
+
+async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
+    if not call_control_id:
+        return
+    telnyx_key = os.getenv("TELNYX_API_KEY")
+    if not telnyx_key:
+        return
+    if delay_s > 0:
+        await asyncio.sleep(delay_s)
+    encoded_call_control_id = quote(call_control_id, safe="")
+    url = f"https://api.telnyx.com/v2/calls/{encoded_call_control_id}/actions/hangup"
+    headers = {"Authorization": f"Bearer {telnyx_key}", "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json={"reason": "normal_clearing"}) as resp:
+                if resp.status >= 300:
+                    await resp.text()
+    except Exception:
+        return
 
 # Helper function to get Google Credentials
 def get_google_credentials():
@@ -294,43 +302,23 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         # TTS likely needs Credentials object
         google_creds_obj = service_account.Credentials.from_service_account_info(google_creds_dict)
     
-    # 1. Services
-    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.15, stop_secs=0.4, confidence=0.45))
-    call_end_delay_s = 2.5
-    try:
-        call_end_delay_s = float(os.getenv("CALL_END_DELAY_S") or 2.5)
-    except Exception:
-        call_end_delay_s = 2.5
-    
-    stt_language = os.getenv("DEEPGRAM_LANGUAGE") or "ar"
-    stt_provider_env = (os.getenv("STT_PROVIDER") or "").strip().lower()
-    stt_provider = stt_provider_env or ("google" if stt_language.lower().startswith("ar") else "deepgram")
+    use_smart_turn = (os.getenv("USE_SMART_TURN") or "true").strip().lower() in {"1", "true", "yes", "y"}
+    vad_stop_secs = 0.2 if use_smart_turn else 0.4
+    vad = SileroVADAnalyzer(
+        params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=vad_stop_secs, confidence=0.45)
+    )
 
-    if stt_provider == "deepgram" and stt_language.lower().startswith("ar"):
-        logger.warning("Deepgram streaming does not support Arabic. Switching STT provider to Google.")
+    stt_language = os.getenv("STT_LANGUAGE") or os.getenv("DEEPGRAM_LANGUAGE") or "ar"
+    stt_language_enum = resolve_stt_language(stt_language)
+    stt_provider = (os.getenv("STT_PROVIDER") or "").strip().lower()
+    if not stt_provider:
+        stt_provider = "google" if stt_language_enum == Language.AR else "deepgram"
+
+    if stt_provider == "deepgram" and stt_language_enum == Language.AR:
+        logger.warning("Deepgram does not support Arabic streaming. Switching STT_PROVIDER to google.")
         stt_provider = "google"
 
-    if stt_provider == "deepgram":
-        deepgram_key = os.getenv("DEEPGRAM_API_KEY")
-        if not deepgram_key:
-            logger.error("CRITICAL: DEEPGRAM_API_KEY is missing in environment variables!")
-        else:
-            logger.info(f"Deepgram API Key found (len={len(deepgram_key)}).")
-
-        dg_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
-        logger.info(f"Initializing Deepgram with encoding: {dg_encoding} (inbound: {inbound_encoding})")
-
-        stt_live_options = build_deepgram_live_options(
-            encoding=dg_encoding,
-            sample_rate=stream_sample_rate,
-            language=stt_language,
-        )
-        stt = DeepgramSTTService(
-            api_key=deepgram_key,
-            live_options=stt_live_options,
-        )
-    else:
-        stt_language_enum = resolve_stt_language(stt_language)
+    if stt_provider == "google":
         stt_model = os.getenv("GOOGLE_STT_MODEL") or ("latest_short" if stt_language_enum == Language.AR else "latest_long")
         stt_location = os.getenv("GOOGLE_STT_LOCATION") or "global"
         logger.info(f"Using Google STT model: {stt_model} ({stt_location})")
@@ -352,6 +340,21 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         else:
             stt_kwargs["credentials_path"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         stt = GoogleSTTService(**stt_kwargs)
+    else:
+        deepgram_key = os.getenv("DEEPGRAM_API_KEY")
+        if not deepgram_key:
+            logger.error("CRITICAL: DEEPGRAM_API_KEY is missing in environment variables!")
+        else:
+            logger.info(f"Deepgram API Key found (len={len(deepgram_key)}).")
+        dg_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
+        logger.info(f"Initializing Deepgram with encoding: {dg_encoding} (inbound: {inbound_encoding})")
+        stt = DeepgramSTTService(
+            api_key=deepgram_key,
+            model=os.getenv("DEEPGRAM_MODEL") or "nova-2-phonecall",
+            language=os.getenv("DEEPGRAM_LANGUAGE") or "en",
+            sample_rate=stream_sample_rate,
+            encoding=dg_encoding,
+        )
     
     # 2. Tools
     tools = [
@@ -401,7 +404,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     tts_encoding = "mulaw" if inbound_encoding == "PCMU" else "alaw" if inbound_encoding == "PCMA" else "linear16"
     tts_sample_rate = stream_sample_rate
     voice_id = os.getenv("GOOGLE_TTS_VOICE_ID") or "ar-XA-Chirp3-HD-Charon"
-    fallback_voice_ids = ["ar-XA-Chirp3-HD-Charon", "ar-XA-Chirp3-HD-Aoede"]
+    fallback_voice_id = "ar-XA-Chirp3-HD-Charon"
     global _GOOGLE_TTS_VOICE_NAMES
     try:
         if _GOOGLE_TTS_VOICE_NAMES is None:
@@ -418,19 +421,10 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 logger.warning(f"Non-Chirp voice configured for streaming TTS ({voice_id}); switching to {candidates[0]}.")
                 voice_id = candidates[0]
         if voice_id not in _GOOGLE_TTS_VOICE_NAMES:
-            fallback_voice_id = next((v for v in fallback_voice_ids if v in _GOOGLE_TTS_VOICE_NAMES), None)
-            if fallback_voice_id:
-                logger.warning(f"Google TTS voice not found: {voice_id}. Falling back to {fallback_voice_id}.")
-                voice_id = fallback_voice_id
-            else:
-                locale = "ar-XA"
-                candidates = [v for v in _GOOGLE_TTS_VOICE_NAMES if v.startswith(f"{locale}-Chirp3-HD-")]
-                if candidates:
-                    logger.warning(f"Google TTS voice not found: {voice_id}. Falling back to {candidates[0]}.")
-                    voice_id = candidates[0]
+            logger.warning(f"Google TTS voice not found: {voice_id}. Falling back to {fallback_voice_id}.")
+            voice_id = fallback_voice_id
     except Exception as e:
         if voice_id.startswith("ar-JO"):
-            fallback_voice_id = fallback_voice_ids[0]
             logger.warning(f"Google TTS voice {voice_id} likely invalid. Falling back to {fallback_voice_id}. ({e})")
             voice_id = fallback_voice_id
     speaking_rate = None
@@ -456,23 +450,35 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     tts = GoogleTTSService(**tts_kwargs)
 
     # 3. Handlers
-    async def confirm_order(function_name, tool_call_id, args, llm, context, result_callback):
-        logger.info(f"Confirming order for lead {lead_data['id']}")
-        update_lead_status(lead_data['id'], 'CONFIRMED')
-        await result_callback("Order confirmed successfully.")
-        if call_control_id:
-            asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
-        else:
-            logger.warning("No call_control_id; cannot hang up after confirmation.")
+    call_end_delay_s = 2.5
+    try:
+        call_end_delay_s = float(os.getenv("CALL_END_DELAY_S") or 2.5)
+    except Exception:
+        call_end_delay_s = 2.5
 
-    async def cancel_order(function_name, tool_call_id, args, llm, context, result_callback):
-        logger.info(f"Cancelling order for lead {lead_data['id']}")
-        update_lead_status(lead_data['id'], 'CANCELLED')
-        await result_callback("Order cancelled.")
+    async def confirm_order(params: FunctionCallParams):
+        logger.info(f"Confirming order for lead {lead_data['id']}")
+        reason = None
+        try:
+            reason = params.arguments.get("reason")
+        except Exception:
+            reason = None
+        update_lead_status(lead_data['id'], 'CONFIRMED')
+        await params.result_callback({"value": "Order confirmed successfully.", "reason": reason})
         if call_control_id:
             asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
-        else:
-            logger.warning("No call_control_id; cannot hang up after cancellation.")
+
+    async def cancel_order(params: FunctionCallParams):
+        logger.info(f"Cancelling order for lead {lead_data['id']}")
+        reason = None
+        try:
+            reason = params.arguments.get("reason")
+        except Exception:
+            reason = None
+        update_lead_status(lead_data['id'], 'CANCELLED')
+        await params.result_callback({"value": "Order cancelled.", "reason": reason})
+        if call_control_id:
+            asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
 
     llm.register_function(
         "update_lead_status_confirmed",
@@ -510,7 +516,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             serializer=serializer,
             add_wav_header=False,
             session_timeout=300,
-            vad_enabled=True,
             vad_analyzer=vad,
             audio_in_enabled=True,
             audio_out_enabled=True,
@@ -519,7 +524,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         )
     )
 
-    # 4. Prompt
     system_prompt = f"""
 # IDENTITY
 You are "Khalid", a professional, polite, and native Jordanian delivery coordinator from "Kawkab Delivery" (شركة كوكب للتوصيل).
@@ -543,9 +547,10 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
 - If they say "No/Cancel": Respond with "ولا يهمك، حصل خير. بس بقدر أعرف شو السبب للإلغاء؟".
 
 # LOGIC & TOOLS
-1. **Confirmation**: If they agree, call `update_lead_status_confirmed` and say: "تمام، هسا بنرتب الأمور ويوصلك على الموعد إن شاء الله. مع السلامة."
-2. **Cancellation**: If they cancel, call `update_lead_status_cancelled` and say: "تم، لغينا الطلب. يومك سعيد، مع السلامة."
+1. **Confirmation**: If they agree, call `update_lead_status_confirmed` and then say: "تمام، هسا بنرتب الأمور ويوصلك على الموعد إن شاء الله. مع السلامة."
+2. **Cancellation**: If they cancel, call `update_lead_status_cancelled` and then say: "تم، لغينا الطلب. يومك سعيد، مع السلامة."
 3. **Handling Interruption**: If the user says "Hello?" or "Are you there?" (ألو / معك؟ / وينك؟ / سلام عليكم / السلام عليكم), respond immediately with: "معك معك، تفضل..." and do NOT repeat the full introduction.
+4. **Tool Safety**: Never confirm or cancel based on greetings or unclear words. Ask 1 short question if unclear.
 
 # CONTEXT
 - Customer: {lead_data['customer_name']}
@@ -553,17 +558,30 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
 - Time: {lead_data['delivery_time']}
 """
 
-    # 4. Prompt & Context
-    # Single context with system prompt AND initial user trigger
     messages = [
-        {"role": "system", "content": system_prompt}
+        {"role": "system", "content": system_prompt},
     ]
     context = LLMContext(messages=messages)
 
-    user_turn_strategies = UserTurnStrategies(
-        start=[TranscriptionUserTurnStartStrategy(use_interim=True)],
-        stop=[TranscriptionUserTurnStopStrategy(timeout=0.4)],
-    )
+    start_strategies = []
+    stop_strategies = []
+    if use_smart_turn:
+        try:
+            from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+            from pipecat.turns.user_start import VADUserTurnStartStrategy
+            from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+
+            start_strategies = [VADUserTurnStartStrategy(enable_interruptions=True)]
+            stop_strategies = [TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())]
+            logger.info("Smart Turn enabled (LocalSmartTurnAnalyzerV3).")
+        except Exception as e:
+            logger.warning(f"Smart Turn unavailable; falling back to transcription turn stop. ({e})")
+            use_smart_turn = False
+    if not use_smart_turn:
+        start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
+        stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=0.4)]
+
+    user_turn_strategies = UserTurnStrategies(start=start_strategies, stop=stop_strategies)
 
     aggregators = LLMContextAggregatorPair(
         context,
@@ -581,11 +599,11 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
     pipeline = Pipeline([
         transport.input(),
         stt,
-        STTFailureFallback(),
         stt_perf,
         aggregators.user(),
         llm,
         llm_perf,
+        JordanianTTSPreprocessor(),
         tts,
         tts_perf,
         transport.output(),
@@ -598,9 +616,20 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
     customer_name = lead_data.get("customer_name") or "العميل"
     order_items = lead_data.get("order_items") or ""
     delivery_time = lead_data.get("delivery_time") or ""
-    greeting_text = f"السلام عليكم، معك خالد من شركة كوكب للتوصيل. كيفك يا {customer_name}؟ في إلك معنا طلب {order_items} المفروض يوصلك على الساعة {delivery_time}. بس حبيت أتأكد إذا الأمور تمام ونبعتلك السائق؟"
+    greeting_text = (
+        f"السلام عليكم، معك خالد من شركة كوكب للتوصيل. كيفك يا {customer_name}؟ "
+        f"في إلك معنا طلب {order_items} المفروض يوصلك على الساعة {delivery_time}. "
+        f"بس حبيت أتأكد إذا الأمور تمام ونبعتلك السائق؟"
+    )
 
     logger.info(f"Queuing greeting (inbound_encoding={inbound_encoding}, tts_encoding={tts_encoding})")
     await task.queue_frames([TTSSpeakFrame(greeting_text)])
+
+    async def post_greeting_follow_up():
+        await asyncio.sleep(7.0)
+        if _PERF.get("last_user_text_ts") is None:
+            await task.queue_frames([TTSSpeakFrame("تمام؟ بتسمعني؟")])
+
+    asyncio.create_task(post_greeting_follow_up())
     logger.info("Starting single pipeline run")
     await runner.run(task)
