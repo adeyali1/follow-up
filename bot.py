@@ -38,6 +38,7 @@ from pipecat.audio.utils import create_stream_resampler
 _GOOGLE_TTS_VOICE_NAMES = None
 _PERF = {"last_user_text_ts": None, "last_llm_start_ts": None, "tts_first_audio_logged": False}
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None}
+BOT_BUILD_ID = "2026-01-20-multimodal-llmrunframe"
 
 
 class STTPerf(FrameProcessor):
@@ -278,6 +279,7 @@ def get_google_credentials():
 
 async def run_bot(websocket_client, lead_data, call_control_id=None):
     logger.info(f"Starting bot for lead: {lead_data['id']}")
+    logger.info(f"Bot build: {BOT_BUILD_ID}")
     use_multimodal_live = os.getenv("USE_MULTIMODAL_LIVE", "false").lower() == "true"
 
     # 0. Handle Telnyx Handshake to get stream_id
@@ -827,4 +829,3 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
     asyncio.create_task(post_greeting_follow_up())
     logger.info("Starting single pipeline run")
     await runner.run(task)
-v
