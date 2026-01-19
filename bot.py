@@ -12,6 +12,7 @@ from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.frames.frames import LLMMessagesAppendFrame
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.google.llm_vertex import GoogleVertexLLMService
 from pipecat.services.google.stt import GoogleSTTService
@@ -83,6 +84,17 @@ def resolve_stt_language(language: str) -> Language:
     return Language.AR
 
 
+def normalize_gemini_live_model_name(model: str) -> str:
+    model = (model or "").strip()
+    if not model:
+        return "models/gemini-2.0-flash-live-001"
+    if model.startswith("models/"):
+        return model
+    if "/" in model:
+        return model
+    return f"models/{model}"
+
+
 def build_deepgram_live_options(*, encoding: str, sample_rate: int, language: str) -> LiveOptions:
     language = (language or "ar").strip()
     model = (os.getenv("DEEPGRAM_MODEL") or "").strip() or None
@@ -115,16 +127,16 @@ def build_deepgram_live_options(*, encoding: str, sample_rate: int, language: st
 def normalize_jordanian_text(text: str) -> str:
     if not text:
         return text
-    replacements = {
-        "السائق": "الشوفير",
-        "الآن": "هسا",
-        "سوف": "رح",
-        "ماذا": "شو",
-        "لماذا": "ليش",
-        "تريد": "بدك",
-        "أريد": "بدي",
-    }
-    for src, dst in replacements.items():
+    replacements = [
+        ("لماذا", "ليش"),
+        ("ماذا", "شو"),
+        ("السائق", "الشوفير"),
+        ("الآن", "هسا"),
+        ("سوف", "رح"),
+        ("تريد", "بدك"),
+        ("أريد", "بدي"),
+    ]
+    for src, dst in replacements:
         text = text.replace(src, dst)
     return text
 
@@ -217,6 +229,7 @@ def get_google_credentials():
 
 async def run_bot(websocket_client, lead_data, call_control_id=None):
     logger.info(f"Starting bot for lead: {lead_data['id']}")
+    use_multimodal_live = os.getenv("USE_MULTIMODAL_LIVE", "false").lower() == "true"
 
     # 0. Handle Telnyx Handshake to get stream_id
     stream_id = "telnyx_stream_placeholder"
@@ -301,12 +314,144 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         google_creds_str = json.dumps(google_creds_dict)
         # TTS likely needs Credentials object
         google_creds_obj = service_account.Credentials.from_service_account_info(google_creds_dict)
+
+    customer_name = lead_data.get("customer_name") or "العميل"
+    order_items = lead_data.get("order_items") or ""
+    delivery_time = lead_data.get("delivery_time") or ""
+    greeting_text = (
+        f"السلام عليكم، معك خالد من شركة كوكب للتوصيل. كيفك يا {customer_name}؟ "
+        f"في إلك معنا طلب {order_items} المفروض يوصلك على الساعة {delivery_time}. "
+        f"بس حبيت أتأكد إذا الأمور تمام ونبعتلك السائق؟"
+    )
     
     use_smart_turn = (os.getenv("USE_SMART_TURN") or "true").strip().lower() in {"1", "true", "yes", "y"}
     vad_stop_secs = 0.2 if use_smart_turn else 0.4
-    vad = SileroVADAnalyzer(
-        params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=vad_stop_secs, confidence=0.45)
+    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.0, start_secs=0.2, stop_secs=vad_stop_secs, confidence=0.45))
+
+    serializer = TelnyxFrameSerializer(
+        stream_id=stream_id,
+        call_control_id=call_control_id,
+        api_key=os.getenv("TELNYX_API_KEY"),
+        outbound_encoding=inbound_encoding,
+        inbound_encoding=inbound_encoding,
+        params=TelnyxFrameSerializer.InputParams(sample_rate=stream_sample_rate),
     )
+
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket_client,
+        params=FastAPIWebsocketParams(
+            serializer=serializer,
+            add_wav_header=False,
+            session_timeout=300,
+            vad_analyzer=vad,
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_in_sample_rate=stream_sample_rate,
+            audio_out_sample_rate=stream_sample_rate,
+        ),
+    )
+
+    system_prompt = f"""
+# IDENTITY
+You are "Khalid", a professional, polite, and native Jordanian delivery coordinator from "Kawkab Delivery" (شركة كوكب للتوصيل).
+Your goal is to confirm delivery details with customers in a way that feels 100% human and local to Amman, Jordan.
+
+# PERSONALITY & TONE
+- **Voice**: Friendly, energetic, and "Ibn Nas" (well-mannered).
+- **Style**: Use the Ammani/Urban Jordanian dialect.
+- **Efficiency**: Jordanians appreciate quick calls. Keep responses under 10 words unless explaining something.
+- **Rules**: Never speak Formal Arabic (Fusha). Never speak English unless the customer starts in English.
+- **Jordanian Only**: If you catch yourself using non-Jordanian words, immediately rephrase in Jordanian.
+
+# OPENING
+- The opening line is already delivered by the system TTS. Do NOT repeat it.
+
+# DIALECT GUIDELINES
+- Use "G" for "Qaf" (e.g., 'Galleh' for 'Qalleh').
+- Use local fillers: "يا هلا والله", "أبشر", "من عيوني", "عشان هيك", "هسا", "مية مية".
+- Prefer Jordanian words: "شو" بدل "ماذا", "ليش" بدل "لماذا", "هسا" بدل "الآن", "بدك" بدل "تريد".
+- If they say "Yes/Okay": Respond with "ممتاز، أبشر" or "مية مية، هسا برتب مع الشوفير".
+- If they say "No/Cancel": Respond with "ولا يهمك، حصل خير. بس بقدر أعرف شو السبب للإلغاء؟".
+
+# LOGIC & TOOLS
+1. **Confirmation**: If they agree, call `update_lead_status_confirmed` and then say: "تمام، هسا بنرتب الأمور ويوصلك على الموعد إن شاء الله. مع السلامة."
+2. **Cancellation**: If they cancel, call `update_lead_status_cancelled` and then say: "تم، لغينا الطلب. يومك سعيد، مع السلامة."
+3. **Handling Interruption**: If the user says "Hello?" or "Are you there?" (ألو / معك؟ / وينك؟ / سلام عليكم / السلام عليكم), respond immediately with: "معك معك، تفضل..." and do NOT repeat the full introduction.
+4. **Tool Safety**: Never confirm or cancel based on greetings or unclear words. Ask 1 short question if unclear.
+
+# CONTEXT
+- Customer: {lead_data['customer_name']}
+- Items: {lead_data['order_items']}
+- Time: {lead_data['delivery_time']}
+"""
+
+    if use_multimodal_live:
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            logger.error("USE_MULTIMODAL_LIVE=true but GOOGLE_API_KEY/GEMINI_API_KEY is missing. Falling back.")
+        else:
+            model = normalize_gemini_live_model_name(os.getenv("GEMINI_LIVE_MODEL") or "gemini-2.0-flash-exp")
+            voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Charon").strip()
+            try:
+                from pipecat.services.gemini_multimodal_live.gemini import (
+                    GeminiMultimodalLiveLLMService as GeminiLiveService,
+                    InputParams as GeminiLiveInputParams,
+                )
+            except Exception:
+                from pipecat.services.google.gemini_live.llm import (
+                    GeminiLiveLLMService as GeminiLiveService,
+                    InputParams as GeminiLiveInputParams,
+                )
+
+            gemini_params = GeminiLiveInputParams(temperature=0.3)
+            gemini_live = GeminiLiveService(
+                api_key=api_key,
+                model=model,
+                voice_id=voice_id,
+                system_instruction=system_prompt,
+                params=gemini_params,
+            )
+
+            call_end_delay_s = 2.5
+            try:
+                call_end_delay_s = float(os.getenv("CALL_END_DELAY_S") or 2.5)
+            except Exception:
+                call_end_delay_s = 2.5
+
+            async def confirm_order(params: FunctionCallParams):
+                logger.info(f"Confirming order for lead {lead_data['id']}")
+                reason = None
+                try:
+                    reason = params.arguments.get("reason")
+                except Exception:
+                    reason = None
+                update_lead_status(lead_data["id"], "CONFIRMED")
+                await params.result_callback({"value": "Order confirmed successfully.", "reason": reason})
+                if call_control_id:
+                    asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
+
+            async def cancel_order(params: FunctionCallParams):
+                logger.info(f"Cancelling order for lead {lead_data['id']}")
+                reason = None
+                try:
+                    reason = params.arguments.get("reason")
+                except Exception:
+                    reason = None
+                update_lead_status(lead_data["id"], "CANCELLED")
+                await params.result_callback({"value": "Order cancelled.", "reason": reason})
+                if call_control_id:
+                    asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
+
+            gemini_live.register_function("update_lead_status_confirmed", confirm_order)
+            gemini_live.register_function("update_lead_status_cancelled", cancel_order)
+
+            pipeline = Pipeline([transport.input(), gemini_live, transport.output()])
+            task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+            runner = PipelineRunner()
+
+            await task.queue_frames([LLMMessagesAppendFrame([{"role": "user", "content": greeting_text}], run_llm=True)])
+            await runner.run(task)
+            return
 
     stt_language = os.getenv("STT_LANGUAGE") or os.getenv("DEEPGRAM_LANGUAGE") or "ar"
     stt_language_enum = resolve_stt_language(stt_language)
@@ -489,81 +634,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         cancel_order
     )
 
-    # 3. Transport (Telnyx)
-    # Note: TelnyxFrameSerializer requires stream_id and call_control_id for full functionality (like hanging up)
-    # In a basic setup, we might not have them immediately from the websocket handshake in the same way.
-    # We will instantiate it with placeholders or extract if possible.
-    # For now, we'll use a dummy stream_id if we don't have one, or rely on what Pipecat needs.
-    
-    # We need to know the call_control_id to hang up. 
-    # If we can't get it from the websocket, we might need to pass it from the webhook handler -> main.py -> run_bot
-    # But for now, let's assume we just want audio streaming working.
-    
-    serializer = TelnyxFrameSerializer(
-        stream_id=stream_id, # Captured from handshake
-        call_control_id=call_control_id,
-        api_key=os.getenv("TELNYX_API_KEY"),
-        outbound_encoding=inbound_encoding,
-        inbound_encoding=inbound_encoding,
-        params=TelnyxFrameSerializer.InputParams(
-            sample_rate=stream_sample_rate
-        )
-    )
-    
-    transport = FastAPIWebsocketTransport(
-        websocket=websocket_client,
-        params=FastAPIWebsocketParams(
-            serializer=serializer,
-            add_wav_header=False,
-            session_timeout=300,
-            vad_analyzer=vad,
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            audio_in_sample_rate=stream_sample_rate,
-            audio_out_sample_rate=stream_sample_rate
-        )
-    )
-
-    system_prompt = f"""
-# ROLE
-You are Khalid, a professional and highly-efficient Delivery Coordinator for "Kawkab Delivery" in Jordan. Your goal is to confirm order details with a tone that is helpful, smart, and natively Jordanian.
-
-# VOICE IDENTITY & STYLE
-- **Language**: Use "Educated Jordanian" (White Arabic). This is a mix of Jordanian Ammiya and simple Fusha. It sounds professional yet local.
-- **Tone**: Energetic, respectful, and crisp.
-- **Phonetics**: Pronounce the "Qaf" (ق) as a soft 'G' (as in 'Goal') in common words, but keep it as 'Q' in professional words like "تأكيد" to sound educated.
-- **Brevity**: This is a voice interface. Keep responses under 10 words. Never use long paragraphs.
-
-# MANDATORY OPENING
-"يعطيك العافية {customer_name}، معك خالد من شركة كوكب للتوصيل. في إلك معنا طلب {order_items}، رح يوصلك على الساعة {delivery_time}. بس حبيت أتأكد إذا الأمور تمام ونعتمد الطلب؟"
-
-# CONVERSATIONAL LOGIC (SMART AGENT)
-1. **The Greeting Loop**: If the user just returns the greeting ("Ahlan", "Salam", "Hala"), do NOT repeat your intro. Say: "يا هلا والله، بس كنت حاب أتأكد... الطلب جاهز نبعته؟"
-2. **Confirmation**: If they agree, call `update_lead_status_confirmed`. Say: "ممتاز، مية مية. هسا بنرتب مع مندوب التوصيل ويوصلك ع الموعد. غلبناك معنا."
-3. **Cancellation**: If they cancel, call `update_lead_status_cancelled`. Say: "ولا يهمك، حصل خير. لغينا الطلب وبنتمنى نخدمك بوقت ثاني. يومك سعيد."
-4. **Clarification**: If they ask a question, answer briefly and immediately pull them back to the confirmation: "صحيح، بس نأكد الطلب عشان نبعته؟"
-
-# VOCABULARY GUIDE (EDUCATED AMMANI)
-- Use "نعتمد" (Na'tamed) instead of "نثبت" or "نأكد". It sounds smarter.
-- Use "مندوب التوصيل" (Mandoub) instead of "السائق" (formal) or "الشوفير" (slang).
-- Use "عشان" (Ashan) instead of "لأجل".
-- Use "بدي" (Beddi) instead of "أريد".
-- Use "تمام" (Tamam) as a filler to confirm they are listening.
-
-# CONSTRAINTS
-- NEVER use formal Fusha like "هل ترغب" or "سوف نقوم".
-- NEVER repeat yourself.
-- If the user is silent, ask once: "معي يا غالي؟"
-- If the user interrupts, stop immediately and address their point.
-# CONTEXT
-- Customer: {lead_data['customer_name']}
-- Items: {lead_data['order_items']}
-- Time: {lead_data['delivery_time']}
-"""
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-    ]
+    messages = [{"role": "system", "content": system_prompt}]
     context = LLMContext(messages=messages)
 
     start_strategies = []
@@ -616,15 +687,6 @@ You are Khalid, a professional and highly-efficient Delivery Coordinator for "Ka
     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
     runner = PipelineRunner()
 
-    customer_name = lead_data.get("customer_name") or "العميل"
-    order_items = lead_data.get("order_items") or ""
-    delivery_time = lead_data.get("delivery_time") or ""
-    greeting_text = (
-        f"السلام عليكم، معك خالد من شركة كوكب للتوصيل. كيفك يا {customer_name}؟ "
-        f"في إلك معنا طلب {order_items} المفروض يوصلك على الساعة {delivery_time}. "
-        f"بس حبيت أتأكد إذا الأمور تمام ونبعتلك السائق؟"
-    )
-
     logger.info(f"Queuing greeting (inbound_encoding={inbound_encoding}, tts_encoding={tts_encoding})")
     await task.queue_frames([TTSSpeakFrame(greeting_text)])
 
@@ -636,4 +698,3 @@ You are Khalid, a professional and highly-efficient Delivery Coordinator for "Ka
     asyncio.create_task(post_greeting_follow_up())
     logger.info("Starting single pipeline run")
     await runner.run(task)
-
