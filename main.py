@@ -245,12 +245,16 @@ async def webhook_route(request: Request):
                             "Authorization": f"Bearer {TELNYX_API_KEY}",
                             "Content-Type": "application/json"
                         }
+                        stream_codec = (os.getenv("TELNYX_STREAM_BIDIRECTIONAL_CODEC") or "PCMA").upper()
+                        if stream_codec not in {"PCMA", "PCMU"}:
+                            print(f"Unsupported TELNYX_STREAM_BIDIRECTIONAL_CODEC={stream_codec}; falling back to PCMA")
+                            stream_codec = "PCMA"
                         payload_data = {
                             "stream_url": stream_url,
                             "stream_track": "both_tracks",
                             "enable_dialogflow": False,
                             "stream_bidirectional_mode": "rtp",
-                            "stream_bidirectional_codec": "L16"
+                            "stream_bidirectional_codec": stream_codec
                         }
                         async with session.post(fork_url, headers=headers, json=payload_data) as response:
                                 print(f"Fallback HTTP Status: {response.status}")
