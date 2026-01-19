@@ -1,6 +1,7 @@
 import os
 import sys
 import ast
+import asyncio
 from loguru import logger
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -296,7 +297,11 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
 
     # 5. Pipeline
     # Disable user turn strategies to prevent false interruptions from Telnyx comfort noise
-    user_agg = LLMUserAggregator(context)
+    user_agg = LLMUserAggregator(
+        context,
+        user_turn_start_strategy=None,
+        user_turn_stop_strategy=None
+    )
     assistant_agg = LLMAssistantAggregator(context)
 
     pipeline = Pipeline([
@@ -317,6 +322,7 @@ If no answer or voicemail, just hang up (I will handle this via timeout or silen
     # Queue context frame to set state, and LLMContextFrame to trigger generation (Updated)
     # We send the same messages in LLMContextFrame to explicitly trigger the LLM to run now.
     logger.info("Queuing initial context and trigger messages...")
+    await asyncio.sleep(0.5) # Add 0.5s delay before first TTS output
     await task.queue_frames([context_frame, LLMContextFrame(context)])
 
     logger.info("Starting pipeline runner...")
