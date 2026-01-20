@@ -159,9 +159,13 @@ class AudioFrameChunker(FrameProcessor):
     def __init__(self, *, chunk_ms: int = 40):
         super().__init__()
         self._chunk_ms = int(chunk_ms)
+        self._pace = (os.getenv("AUDIO_OUT_PACE") or "true").lower() == "true"
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
+        if self._chunk_ms <= 0:
+            await self.push_frame(frame, direction)
+            return
         if isinstance(frame, AudioRawFrame):
             audio = frame.audio
             if isinstance(audio, (bytes, bytearray)) and len(audio) > 0:
@@ -174,6 +178,7 @@ class AudioFrameChunker(FrameProcessor):
                     chunk_bytes = max(chunk_bytes - (chunk_bytes % bytes_per_frame), bytes_per_frame)
                     if len(audio) > chunk_bytes:
                         frame_type = type(frame)
+                        first = True
                         for i in range(0, len(audio), chunk_bytes):
                             chunk = audio[i : i + chunk_bytes]
                             if not chunk:
@@ -183,9 +188,12 @@ class AudioFrameChunker(FrameProcessor):
                                     frame_type(audio=chunk, sample_rate=frame.sample_rate, num_channels=frame.num_channels),
                                     direction,
                                 )
+                                if self._pace and not first:
+                                    await asyncio.sleep(self._chunk_ms / 1000)
                             except Exception:
                                 await self.push_frame(frame, direction)
                                 return
+                            first = False
                         return
         await self.push_frame(frame, direction)
 
@@ -292,6 +300,16 @@ def build_multimodal_opening_message(greeting_text: str) -> str:
     return greeting_text
 
 
+def normalize_customer_name_for_ar(name: str) -> str:
+    raw = (name or "").strip()
+    if not raw:
+        return raw
+    lowered = raw.lower()
+    if lowered == "oday":
+        return "عدي"
+    return raw
+
+
 async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
     if not call_control_id:
         return
@@ -392,8 +410,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     except Exception as e:
         logger.error(f"Failed to capture stream_id from initial message: {e}")
 
-    customer_name = lead_data.get("customer_name") or "العميل"
-    greeting_text = f"السلام عليكم، معك خالد من شركة كوكب للتوصيل. معك يا {customer_name}؟"
+    customer_name = normalize_customer_name_for_ar(lead_data.get("customer_name") or "العميل")
+    greeting_text = f"السلام عليكم، معك خالد من شركة كوكب للتوصيل. معي يا {customer_name}؟"
     vad_stop_secs = 0.2
     try:
         vad_stop_secs = float(os.getenv("VAD_STOP_SECS") or 0.2)
@@ -461,8 +479,15 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
 - Your very first spoken line must be EXACTLY this greeting, then wait for the customer:
   "{greeting_text}"
 
+# GREETING STYLE
+- Do not repeat the customer name more than once in the greeting.
+- Do not say \"معك\" twice in the same sentence; use \"معي\" when checking if they are there.
+
+# RESCHEDULE
+- If the customer asks to move it to tomorrow (\"لبكرا\"), respond briefly:\n  \"تمام، لبكرا ماشي. أي ساعة بناسبك؟\" then wait.
+
 # TASK WORKFLOW
-1. Confirm: \"عدي، طلبك {lead_data['order_items']} رح يوصل ع الساعة {lead_data['delivery_time']}. بنعتمد؟\"
+1. Confirm: \"{customer_name}، طلبك {lead_data['order_items']} رح يوصل ع الساعة {lead_data['delivery_time']}. بنعتمد؟\"
 2. Success: If confirmed, call update_lead_status_confirmed immediately, then say: \"مية مية، هسا برتب مع المندوب ويوصلك ع الموعد. غلبناك!\"
 3. Cancellation: If they cancel, call update_lead_status_cancelled immediately, then say: \"ولا يهمك، حصل خير. لغينا الطلب وبنتمنى نخدمك مرة تانية.\"
 
@@ -663,7 +688,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         inbound_audio_logger = InboundAudioLogger()
         turn_state_logger = TurnStateLogger()
         outbound_audio_logger = OutboundAudioLogger()
-        audio_chunker = AudioFrameChunker(chunk_ms=int(os.getenv("AUDIO_OUT_CHUNK_MS") or 40))
+        audio_chunker = AudioFrameChunker(chunk_ms=int(os.getenv("AUDIO_OUT_CHUNK_MS") or 0))
 
         pipeline = Pipeline(
             [
