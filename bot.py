@@ -123,6 +123,14 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and getattr(frame, "role", None) == "user":
+            is_final = True
+            try:
+                is_final = bool(getattr(frame, "is_final", True))
+            except Exception:
+                is_final = True
+            if not is_final:
+                await self.push_frame(frame, direction)
+                return
             now = time.monotonic()
             self._last_user_transcript_ts = now
             if self._pending is not None:
@@ -584,19 +592,20 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         gemini_live.register_function("update_lead_status_cancelled", cancel_order)
 
         input_resampler = AudioSampleRateResampler(
-            target_input_sample_rate=gemini_in_sample_rate,
-            target_output_sample_rate=stream_sample_rate,
+            target_input_sample_rate=stream_sample_rate,
+            target_output_sample_rate=gemini_in_sample_rate,
         )
         output_resampler = AudioSampleRateResampler(
             target_input_sample_rate=gemini_in_sample_rate,
             target_output_sample_rate=stream_sample_rate,
         )
         mm_perf = MultimodalPerf()
+        logger.info(f"Multimodal resamplers: in {stream_sample_rate}->{gemini_in_sample_rate}, out {gemini_in_sample_rate}->{stream_sample_rate}")
 
         opening_message = build_multimodal_opening_message(greeting_text)
         mm_context = LLMContext(messages=[{"role": "user", "content": opening_message}])
         user_mute_strategies = []
-        mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
+        mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "false").lower() == "true"
         if mute_first_bot:
             try:
                 from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
