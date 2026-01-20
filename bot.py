@@ -487,6 +487,15 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             GeminiLiveLLMService as GeminiLiveService,
             InputParams as GeminiLiveInputParams,
         )
+        http_api_version = (os.getenv("GEMINI_LIVE_HTTP_API_VERSION") or "v1beta").strip()
+        http_options = None
+        if http_api_version:
+            try:
+                from google.genai.types import HttpOptions
+
+                http_options = HttpOptions(api_version=http_api_version)
+            except Exception:
+                http_options = None
         try:
             from pipecat.services.google.gemini_live.llm import GeminiModalities
         except Exception:
@@ -527,6 +536,8 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
                 "params": gemini_params,
                 "inference_on_context_initialization": True,
             }
+            if http_options is not None:
+                gemini_kwargs["http_options"] = http_options
             if model:
                 gemini_kwargs["model"] = model
             gemini_live = GeminiLiveService(**gemini_kwargs)
@@ -627,6 +638,12 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
                 logger.error(msg)
             elif "received 1008" in msg or "policy violation" in msg or "is not found" in msg or "bidiGenerateContent" in msg:
                 live_connection_failed["value"] = True
+                if "is not found for API version v1beta" in msg:
+                    logger.error(
+                        "GeminiLive model/version mismatch. If using Google AI Studio API key, use a Google Live model like "
+                        "models/gemini-2.0-flash-live-001 or models/gemini-2.5-flash-native-audio-preview-12-2025. "
+                        "If needed, set GEMINI_LIVE_HTTP_API_VERSION=v1alpha."
+                    )
                 logger.error(f"GeminiLive rejected model/key: {msg}")
             else:
                 logger.error(f"GeminiLive error: {msg}")
