@@ -679,7 +679,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             else:
                 logger.error(f"GeminiLive error: {msg}")
 
-        transcript_run_delay_s = 0.0
+        transcript_run_delay_s = 0.7
         try:
             transcript_run_delay_s = float(os.getenv("MULTIMODAL_TRANSCRIPT_STOP_S") or 0.7)
         except Exception:
