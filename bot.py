@@ -26,6 +26,7 @@ import time
 
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None}
 BOT_BUILD_ID = "2026-01-20-multimodal-llmrunframe"
+_VAD_MODEL = {"value": None}
 
 
 class MultimodalPerf(FrameProcessor):
@@ -425,9 +426,15 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         vad_confidence = float(os.getenv("VAD_CONFIDENCE") or 0.7)
     except Exception:
         vad_confidence = 0.7
-    vad = SileroVADAnalyzer(
-        params=VADParams(min_volume=vad_min_volume, start_secs=0.2, stop_secs=vad_stop_secs, confidence=vad_confidence)
-    )
+    vad = None
+    cached_vad = _VAD_MODEL.get("value")
+    if cached_vad is None:
+        vad = SileroVADAnalyzer(
+            params=VADParams(min_volume=vad_min_volume, start_secs=0.2, stop_secs=vad_stop_secs, confidence=vad_confidence)
+        )
+        _VAD_MODEL["value"] = vad
+    else:
+        vad = cached_vad
 
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
@@ -471,8 +478,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
 
 # LIVE CONVERSATION LOGIC
 - Turn-Taking: If the user interrupts you, STOP talking immediately and listen.
-- Greeting State: If the user says \"Hello\" or \"Salam\" first, do NOT repeat your full intro. Just say: \"يا هلا والله، معك خالد... بس كنت حاب أتأكد من طلبك...\".
-- Silence Handling: If the user is silent for too long, ask politely: \"معي يا غالي؟\" or \"ألو؟ عدي معي؟\".
+- Silence Handling: If the user is silent for too long, ask politely: \"معي يا غالي؟\".
 - Brevity: Phone calls are expensive and users are busy. Keep 90% of your responses under 10 words.
 
 # GREETING RULE (IMPORTANT)
@@ -748,6 +754,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
                 timeout_s = float(os.getenv("MULTIMODAL_STUCK_TIMEOUT_S") or 10.0)
             except Exception:
                 timeout_s = 10.0
+            last_triggered_for_ts = None
             while True:
                 await asyncio.sleep(0.5)
                 if not call_alive["value"]:
@@ -758,14 +765,12 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
                     continue
                 if bot_ts is not None and bot_ts > user_ts:
                     continue
+                if last_triggered_for_ts == user_ts:
+                    continue
                 if time.monotonic() - user_ts >= timeout_s:
-                    _MM["last_user_transcription_ts"] = None
-                    await task.queue_frames(
-                        [
-                            LLMMessagesAppendFrame([{"role": "user", "content": "رد بسرعة وباختصار."}], run_llm=False),
-                            LLMRunFrame(),
-                        ]
-                    )
+                    last_triggered_for_ts = user_ts
+                    logger.warning("Multimodal: stuck watchdog triggered; re-running LLM without injecting extra text")
+                    await task.queue_frames([LLMRunFrame()])
 
         async def multimodal_silent_start_retry():
             timeout_s = 6.0
@@ -797,7 +802,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
 
         enable_start_retry = (os.getenv("MULTIMODAL_ENABLE_START_RETRY") or "false").lower() == "true"
         enable_first_turn_failsafe = (os.getenv("MULTIMODAL_ENABLE_FIRST_TURN_FAILSAFE") or "false").lower() == "true"
-        enable_stuck_watchdog = (os.getenv("MULTIMODAL_ENABLE_STUCK_WATCHDOG") or "true").lower() == "true"
+        enable_stuck_watchdog = (os.getenv("MULTIMODAL_ENABLE_STUCK_WATCHDOG") or "false").lower() == "true"
         if enable_start_retry:
             asyncio.create_task(multimodal_silent_start_retry())
         if enable_first_turn_failsafe:
