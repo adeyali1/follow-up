@@ -2,7 +2,6 @@ import os
 import asyncio
 import aiohttp
 from urllib.parse import quote
-import audioop
 from loguru import logger
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -17,14 +16,13 @@ from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.frames.frames import InputAudioRawFrame, OutputAudioRawFrame, TranscriptionFrame
+from pipecat.frames.frames import AudioRawFrame, InputAudioRawFrame, TranscriptionFrame
 from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy
 from services.supabase_service import update_lead_status
 
 import json
 import time
-from pipecat.audio.utils import create_stream_resampler
 
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None}
 BOT_BUILD_ID = "2026-01-20-multimodal-llmrunframe"
@@ -122,6 +120,22 @@ class TurnStateLogger(FrameProcessor):
         elif frame_name in {"BotStartedSpeakingFrame", "TTSStartedFrame"} and not self._logged_bot_audio:
             self._logged_bot_audio = True
             logger.info(f"Turn: first bot audio started ({frame_name})")
+        await self.push_frame(frame, direction)
+
+
+class OutboundAudioLogger(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self._logged = False
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if not self._logged and isinstance(frame, AudioRawFrame):
+            self._logged = True
+            try:
+                logger.info(f"AudioOut: first audio frame sr={frame.sample_rate} bytes={len(frame.audio)}")
+            except Exception:
+                logger.info("AudioOut: first audio frame")
         await self.push_frame(frame, direction)
 
 
@@ -227,68 +241,6 @@ def build_multimodal_opening_message(greeting_text: str) -> str:
     return greeting_text
 
 
-class AudioSampleRateResampler(FrameProcessor):
-    def __init__(self, *, target_input_sample_rate: int, target_output_sample_rate: int):
-        super().__init__()
-        self._target_in = int(target_input_sample_rate)
-        self._target_out = int(target_output_sample_rate)
-        self._in_resampler = create_stream_resampler()
-        self._out_resampler = create_stream_resampler()
-        self._logged_in = 0
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, InputAudioRawFrame) and frame.sample_rate != self._target_in:
-            resampled = await self._in_resampler.resample(frame.audio, frame.sample_rate, self._target_in)
-            if not resampled:
-                return
-            frame = InputAudioRawFrame(audio=resampled, sample_rate=self._target_in, num_channels=frame.num_channels)
-            if self._logged_in < 10:
-                logger.debug(f"AudioResampled: {frame.sample_rate} bytes={len(resampled)}")
-                self._logged_in += 1
-        elif isinstance(frame, OutputAudioRawFrame) and frame.sample_rate != self._target_out:
-            resampled = await self._out_resampler.resample(frame.audio, frame.sample_rate, self._target_out)
-            frame = OutputAudioRawFrame(audio=resampled, sample_rate=self._target_out, num_channels=frame.num_channels)
-        await self.push_frame(frame, direction)
-
-
-class TelnyxPcmDecoder(FrameProcessor):
-    def __init__(self, *, inbound_encoding: str, min_bytes: int = 40):
-        super().__init__()
-        self._encoding = (inbound_encoding or "").strip().upper()
-        self._min_bytes = int(min_bytes)
-        self._logged = 0
-        self._post_logged = 0
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, InputAudioRawFrame):
-            audio = frame.audio
-            if isinstance(audio, (bytes, bytearray)):
-                if len(audio) < self._min_bytes:
-                    return
-                if self._logged < 10:
-                    logger.debug(f"AudioIn: sr={frame.sample_rate} bytes={len(audio)} enc={self._encoding}")
-                    self._logged += 1
-                if self._encoding in {"PCMA", "PCMU"}:
-                    try:
-                        decoded = (
-                            audioop.alaw2lin(audio, 2) if self._encoding == "PCMA" else audioop.ulaw2lin(audio, 2)
-                        )
-                        if decoded:
-                            frame = InputAudioRawFrame(
-                                audio=decoded,
-                                sample_rate=frame.sample_rate,
-                                num_channels=frame.num_channels,
-                            )
-                            if self._post_logged < 10:
-                                logger.debug(f"AudioDecoded: sr={frame.sample_rate} bytes={len(decoded)} enc={self._encoding}")
-                                self._post_logged += 1
-                    except Exception:
-                        pass
-        await self.push_frame(frame, direction)
-
-
 async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
     if not call_control_id:
         return
@@ -312,6 +264,11 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     logger.info(f"Starting bot for lead: {lead_data['id']}")
     logger.info(f"Bot build: {BOT_BUILD_ID}")
     use_multimodal_live = os.getenv("USE_MULTIMODAL_LIVE", "false").lower() == "true"
+    pipeline_sample_rate = 16000
+    try:
+        pipeline_sample_rate = int(os.getenv("PIPELINE_SAMPLE_RATE") or os.getenv("GEMINI_LIVE_SAMPLE_RATE") or 16000)
+    except Exception:
+        pipeline_sample_rate = 16000
 
     # 0. Handle Telnyx Handshake to get stream_id
     stream_id = "telnyx_stream_placeholder"
@@ -409,7 +366,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         api_key=os.getenv("TELNYX_API_KEY"),
         outbound_encoding=inbound_encoding,
         inbound_encoding=inbound_encoding,
-        params=TelnyxFrameSerializer.InputParams(sample_rate=stream_sample_rate),
+        params=TelnyxFrameSerializer.InputParams(sample_rate=pipeline_sample_rate),
     )
 
     transport = FastAPIWebsocketTransport(
@@ -421,8 +378,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             vad_analyzer=vad,
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_in_sample_rate=stream_sample_rate,
-            audio_out_sample_rate=stream_sample_rate,
+            audio_in_sample_rate=pipeline_sample_rate,
+            audio_out_sample_rate=pipeline_sample_rate,
         ),
     )
 
@@ -450,7 +407,8 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
 - Brevity: Phone calls are expensive and users are busy. Keep 90% of your responses under 10 words.
 
 # GREETING RULE (IMPORTANT)
-- Your very first spoken line must match the prepared greeting message in the conversation context (assistant message). Say it once, then wait for the customer.
+- Your very first spoken line must be EXACTLY this greeting, then wait for the customer:
+  "{greeting_text}"
 
 # TASK WORKFLOW
 1. Confirm: \"عدي، طلبك {lead_data['order_items']} رح يوصل ع الساعة {lead_data['delivery_time']}. بنعتمد؟\"
@@ -469,11 +427,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             logger.error("USE_MULTIMODAL_LIVE=true but GOOGLE_API_KEY/GEMINI_API_KEY is missing.")
             return
 
-        gemini_in_sample_rate = 16000
-        try:
-            gemini_in_sample_rate = int(os.getenv("GEMINI_LIVE_SAMPLE_RATE") or 16000)
-        except Exception:
-            gemini_in_sample_rate = 16000
+        gemini_in_sample_rate = pipeline_sample_rate
 
         model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
         model = normalize_gemini_live_model_name(model_env) if model_env else None
@@ -565,18 +519,10 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         gemini_live.register_function("update_lead_status_confirmed", confirm_order)
         gemini_live.register_function("update_lead_status_cancelled", cancel_order)
 
-        input_resampler = AudioSampleRateResampler(
-            target_input_sample_rate=gemini_in_sample_rate,
-            target_output_sample_rate=stream_sample_rate,
-        )
-        output_resampler = AudioSampleRateResampler(
-            target_input_sample_rate=gemini_in_sample_rate,
-            target_output_sample_rate=stream_sample_rate,
-        )
         mm_perf = MultimodalPerf()
-        logger.info(f"Multimodal resamplers: in {stream_sample_rate}->{gemini_in_sample_rate}, out {gemini_in_sample_rate}->{stream_sample_rate}")
+        logger.info(f"Multimodal pipeline sample_rate={pipeline_sample_rate}, telnyx_sr={stream_sample_rate}, encoding={inbound_encoding}")
 
-        mm_context = LLMContext(messages=[{"role": "assistant", "content": greeting_text}])
+        mm_context = LLMContext(messages=[])
         user_mute_strategies = []
         mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
         if mute_first_bot:
@@ -646,24 +592,19 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             call_end_delay_s=call_end_delay_s,
             finalized_ref=lead_finalized,
         )
-        telnyx_decoder = TelnyxPcmDecoder(
-            inbound_encoding=inbound_encoding,
-            min_bytes=int(os.getenv("TELNYX_MIN_AUDIO_BYTES") or 40),
-        )
         turn_state_logger = TurnStateLogger()
+        outbound_audio_logger = OutboundAudioLogger()
 
         pipeline = Pipeline(
             [
                 transport.input(),
                 mm_aggregators.user(),
-                telnyx_decoder,
-                input_resampler,
                 gemini_live,
                 transcript_trigger,
                 transcript_fallback,
                 turn_state_logger,
+                outbound_audio_logger,
                 mm_perf,
-                output_resampler,
                 transport.output(),
                 mm_aggregators.assistant(),
             ]
