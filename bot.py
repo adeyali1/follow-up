@@ -474,7 +474,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
                 "voice_id": voice_id,
                 "system_instruction": system_prompt,
                 "params": gemini_params,
-                "inference_on_context_initialization": False,
+                "inference_on_context_initialization": True,
             }
             if model:
                 gemini_kwargs["model"] = model
@@ -522,7 +522,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         mm_perf = MultimodalPerf()
         logger.info(f"Multimodal pipeline sample_rate={pipeline_sample_rate}, telnyx_sr={stream_sample_rate}, encoding={inbound_encoding}")
 
-        mm_context = LLMContext(messages=[{"role": "user", "content": " "}])
+        mm_context = LLMContext(messages=[{"role": "user", "content": "ألو"}])
         user_mute_strategies = []
         mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
         if mute_first_bot:
@@ -623,13 +623,10 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             if did_trigger_initial_run["value"]:
                 return
             did_trigger_initial_run["value"] = True
-            try:
-                logger.info(
-                    f"Multimodal: client connected, triggering initial LLMRunFrame (context_messages={len(mm_context.messages)})"
-                )
-            except Exception:
-                logger.info("Multimodal: client connected, triggering initial LLMRunFrame")
-            await task.queue_frames([LLMRunFrame()])
+            logger.info(
+                "Multimodal: client connected; expecting initial response from context initialization "
+                f"(context_messages={len(getattr(mm_context, 'messages', []) or [])})"
+            )
 
         @transport.event_handler("on_client_disconnected")
         async def _on_client_disconnected(_transport, _client):
