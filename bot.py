@@ -132,6 +132,12 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
                 await self.push_frame(frame, direction)
                 return
             now = time.monotonic()
+            try:
+                text = (getattr(frame, "text", None) or "").strip()
+                if text:
+                    logger.debug(f"Multimodal: final user transcript received ({len(text)} chars)")
+            except Exception:
+                pass
             self._last_user_transcript_ts = now
             if self._pending is not None:
                 self._pending.cancel()
@@ -454,6 +460,12 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
+    opening_rule = (
+        "- The opening line is NOT delivered yet. You must say the opening line yourself."
+        if use_multimodal_live
+        else "- The opening line is already delivered by the system TTS. Do NOT repeat it."
+    )
+
     system_prompt = f"""
 # IDENTITY
 You are "Khalid", a professional, polite, and native Jordanian delivery coordinator from "Kawkab Delivery" (شركة كوكب للتوصيل).
@@ -467,7 +479,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
 - **Jordanian Only**: If you catch yourself using non-Jordanian words, immediately rephrase in Jordanian.
 
 # OPENING
-- The opening line is already delivered by the system TTS. Do NOT repeat it.
+{opening_rule}
 
 # DIALECT GUIDELINES
 - Use "G" for "Qaf" (e.g., 'Galleh' for 'Qalleh').
@@ -614,9 +626,25 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             except Exception:
                 pass
         logger.info(f"Multimodal mute until first bot complete: {bool(user_mute_strategies)}")
+        stop_timeout_s = 0.8
+        try:
+            stop_timeout_s = float(os.getenv("MULTIMODAL_TURN_STOP_TIMEOUT_S") or 0.8)
+        except Exception:
+            stop_timeout_s = 0.8
+        start_strategies = []
+        try:
+            from pipecat.turns.user_start import VADUserTurnStartStrategy
+
+            start_strategies = [VADUserTurnStartStrategy(enable_interruptions=False)]
+        except Exception:
+            start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
+        stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=stop_timeout_s)]
         mm_aggregators = LLMContextAggregatorPair(
             mm_context,
-            user_params=LLMUserAggregatorParams(user_mute_strategies=user_mute_strategies),
+            user_params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(start=start_strategies, stop=stop_strategies),
+                user_mute_strategies=user_mute_strategies,
+            ),
         )
         try:
             maybe_coro = gemini_live.set_context(mm_context)
