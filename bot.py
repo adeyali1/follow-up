@@ -139,6 +139,57 @@ class OutboundAudioLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class InboundAudioLogger(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self._logged = False
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if not self._logged and isinstance(frame, InputAudioRawFrame):
+            self._logged = True
+            try:
+                logger.info(f"AudioInDecoded: first audio frame sr={frame.sample_rate} bytes={len(frame.audio)}")
+            except Exception:
+                logger.info("AudioInDecoded: first audio frame")
+        await self.push_frame(frame, direction)
+
+
+class AudioFrameChunker(FrameProcessor):
+    def __init__(self, *, chunk_ms: int = 40):
+        super().__init__()
+        self._chunk_ms = int(chunk_ms)
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, AudioRawFrame):
+            audio = frame.audio
+            if isinstance(audio, (bytes, bytearray)) and len(audio) > 0:
+                sample_rate = int(getattr(frame, "sample_rate", 0) or 0)
+                channels = int(getattr(frame, "num_channels", 1) or 1)
+                if sample_rate > 0 and channels > 0 and self._chunk_ms > 0:
+                    bytes_per_sample = 2
+                    bytes_per_frame = channels * bytes_per_sample
+                    chunk_bytes = int(sample_rate * self._chunk_ms / 1000) * bytes_per_frame
+                    chunk_bytes = max(chunk_bytes - (chunk_bytes % bytes_per_frame), bytes_per_frame)
+                    if len(audio) > chunk_bytes:
+                        frame_type = type(frame)
+                        for i in range(0, len(audio), chunk_bytes):
+                            chunk = audio[i : i + chunk_bytes]
+                            if not chunk:
+                                continue
+                            try:
+                                await self.push_frame(
+                                    frame_type(audio=chunk, sample_rate=frame.sample_rate, num_channels=frame.num_channels),
+                                    direction,
+                                )
+                            except Exception:
+                                await self.push_frame(frame, direction)
+                                return
+                        return
+        await self.push_frame(frame, direction)
+
+
 class LeadStatusTranscriptFallback(FrameProcessor):
     def __init__(self, *, lead_id: str, call_control_id: str | None, call_end_delay_s: float, finalized_ref: dict):
         super().__init__()
@@ -522,7 +573,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         mm_perf = MultimodalPerf()
         logger.info(f"Multimodal pipeline sample_rate={pipeline_sample_rate}, telnyx_sr={stream_sample_rate}, encoding={inbound_encoding}")
 
-        mm_context = LLMContext(messages=[{"role": "user", "content": "ألو"}])
+        mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ"}])
         user_mute_strategies = []
         mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
         if mute_first_bot:
@@ -592,18 +643,22 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             call_end_delay_s=call_end_delay_s,
             finalized_ref=lead_finalized,
         )
+        inbound_audio_logger = InboundAudioLogger()
         turn_state_logger = TurnStateLogger()
         outbound_audio_logger = OutboundAudioLogger()
+        audio_chunker = AudioFrameChunker(chunk_ms=int(os.getenv("AUDIO_OUT_CHUNK_MS") or 40))
 
         pipeline = Pipeline(
             [
                 transport.input(),
+                inbound_audio_logger,
                 mm_aggregators.user(),
                 gemini_live,
                 transcript_trigger,
                 transcript_fallback,
                 turn_state_logger,
                 outbound_audio_logger,
+                audio_chunker,
                 mm_perf,
                 transport.output(),
                 mm_aggregators.assistant(),
