@@ -206,12 +206,16 @@ class AudioSampleRateResampler(FrameProcessor):
         self._target_out = int(target_output_sample_rate)
         self._in_resampler = create_stream_resampler()
         self._out_resampler = create_stream_resampler()
+        self._logged_in = 0
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         if isinstance(frame, InputAudioRawFrame) and frame.sample_rate != self._target_in:
             resampled = await self._in_resampler.resample(frame.audio, frame.sample_rate, self._target_in)
             frame = InputAudioRawFrame(audio=resampled, sample_rate=self._target_in, num_channels=frame.num_channels)
+            if self._logged_in < 10:
+                logger.debug(f"AudioResampled: {frame.sample_rate} bytes={len(resampled)}")
+                self._logged_in += 1
         elif isinstance(frame, OutputAudioRawFrame) and frame.sample_rate != self._target_out:
             resampled = await self._out_resampler.resample(frame.audio, frame.sample_rate, self._target_out)
             frame = OutputAudioRawFrame(audio=resampled, sample_rate=self._target_out, num_channels=frame.num_channels)
@@ -219,32 +223,39 @@ class AudioSampleRateResampler(FrameProcessor):
 
 
 class TelnyxPcmDecoder(FrameProcessor):
-    def __init__(self, *, inbound_encoding: str):
+    def __init__(self, *, inbound_encoding: str, min_bytes: int = 40):
         super().__init__()
         self._encoding = (inbound_encoding or "").strip().upper()
+        self._min_bytes = int(min_bytes)
         self._logged = 0
+        self._post_logged = 0
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         if isinstance(frame, InputAudioRawFrame):
             audio = frame.audio
             if isinstance(audio, (bytes, bytearray)):
+                if len(audio) < self._min_bytes:
+                    return
                 if self._logged < 10:
                     logger.debug(f"AudioIn: sr={frame.sample_rate} bytes={len(audio)} enc={self._encoding}")
                     self._logged += 1
                 if self._encoding in {"PCMA", "PCMU"}:
-                    expected_8bit = int(frame.sample_rate / 50) * max(int(getattr(frame, "num_channels", 1) or 1), 1)
-                    if len(audio) in {expected_8bit, expected_8bit * 2} and len(audio) == expected_8bit:
+                    should_decode = True
+                    try:
+                        if self._encoding == "PCMA" and len(audio) >= 50:
+                            should_decode = (audio.count(b"\xD5") / len(audio)) >= 0.02
+                        if self._encoding == "PCMU" and len(audio) >= 50:
+                            should_decode = (audio.count(b"\xFF") / len(audio)) >= 0.02
+                    except Exception:
+                        should_decode = True
+                    if should_decode:
                         try:
-                            if self._encoding == "PCMA":
-                                decoded = audioop.alaw2lin(audio, 2)
-                            else:
-                                decoded = audioop.ulaw2lin(audio, 2)
-                            frame = InputAudioRawFrame(
-                                audio=decoded,
-                                sample_rate=frame.sample_rate,
-                                num_channels=frame.num_channels,
-                            )
+                            decoded = audioop.alaw2lin(audio, 2) if self._encoding == "PCMA" else audioop.ulaw2lin(audio, 2)
+                            frame = InputAudioRawFrame(audio=decoded, sample_rate=frame.sample_rate, num_channels=frame.num_channels)
+                            if self._post_logged < 10:
+                                logger.debug(f"AudioDecoded: sr={frame.sample_rate} bytes={len(decoded)} enc={self._encoding}")
+                                self._post_logged += 1
                         except Exception:
                             pass
         await self.push_frame(frame, direction)
@@ -602,7 +613,10 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             call_end_delay_s=call_end_delay_s,
             finalized_ref=lead_finalized,
         )
-        telnyx_decoder = TelnyxPcmDecoder(inbound_encoding=inbound_encoding)
+        telnyx_decoder = TelnyxPcmDecoder(
+            inbound_encoding=inbound_encoding,
+            min_bytes=int(os.getenv("TELNYX_MIN_AUDIO_BYTES") or 40),
+        )
 
         pipeline = Pipeline(
             [
