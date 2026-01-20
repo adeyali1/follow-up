@@ -97,6 +97,34 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class TurnStateLogger(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self._user_turn_started_ts = None
+        self._logged_bot_audio = False
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        frame_name = type(frame).__name__
+        if frame_name == "UserStartedSpeakingFrame":
+            self._user_turn_started_ts = time.monotonic()
+            logger.info("Turn: user started speaking")
+        elif frame_name == "UserStoppedSpeakingFrame":
+            now = time.monotonic()
+            dur = None
+            if self._user_turn_started_ts is not None:
+                dur = now - self._user_turn_started_ts
+            self._user_turn_started_ts = None
+            if dur is None:
+                logger.info("Turn: user stopped speaking")
+            else:
+                logger.info(f"Turn: user stopped speaking (dur={dur:.2f}s)")
+        elif frame_name in {"BotStartedSpeakingFrame", "TTSStartedFrame"} and not self._logged_bot_audio:
+            self._logged_bot_audio = True
+            logger.info(f"Turn: first bot audio started ({frame_name})")
+        await self.push_frame(frame, direction)
+
+
 class LeadStatusTranscriptFallback(FrameProcessor):
     def __init__(self, *, lead_id: str, call_control_id: str | None, call_end_delay_s: float, finalized_ref: dict):
         super().__init__()
@@ -550,7 +578,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
 
         mm_context = LLMContext(messages=[{"role": "assistant", "content": greeting_text}])
         user_mute_strategies = []
-        mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "false").lower() == "true"
+        mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
         if mute_first_bot:
             try:
                 from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
@@ -564,14 +592,19 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             stop_timeout_s = float(os.getenv("MULTIMODAL_TURN_STOP_TIMEOUT_S") or 0.8)
         except Exception:
             stop_timeout_s = 0.8
-        start_strategies = []
-        try:
-            from pipecat.turns.user_start import VADUserTurnStartStrategy
+        start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
+        if (os.getenv("MULTIMODAL_USE_VAD_TURN_START") or "false").lower() == "true":
+            try:
+                from pipecat.turns.user_start import VADUserTurnStartStrategy
 
-            start_strategies = [VADUserTurnStartStrategy(enable_interruptions=False)]
-        except Exception:
-            start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
+                start_strategies = [VADUserTurnStartStrategy(enable_interruptions=False)]
+            except Exception:
+                start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
         stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=stop_timeout_s)]
+        logger.info(
+            f"Multimodal turn start strategy: {type(start_strategies[0]).__name__} "
+            f"(MULTIMODAL_USE_VAD_TURN_START={(os.getenv('MULTIMODAL_USE_VAD_TURN_START') or 'false').lower() == 'true'})"
+        )
         mm_aggregators = LLMContextAggregatorPair(
             mm_context,
             user_params=LLMUserAggregatorParams(
@@ -617,6 +650,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             inbound_encoding=inbound_encoding,
             min_bytes=int(os.getenv("TELNYX_MIN_AUDIO_BYTES") or 40),
         )
+        turn_state_logger = TurnStateLogger()
 
         pipeline = Pipeline(
             [
@@ -627,6 +661,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
                 gemini_live,
                 transcript_trigger,
                 transcript_fallback,
+                turn_state_logger,
                 mm_perf,
                 output_resampler,
                 transport.output(),
