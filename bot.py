@@ -8,15 +8,14 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.frames.frames import LLMRunFrame, LLMMessagesAppendFrame
+from pipecat.frames.frames import LLMRunFrame
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.frames.frames import AudioRawFrame, InputAudioRawFrame, TranscriptionFrame
-from pipecat.transcriptions.language import Language
+from pipecat.frames.frames import AudioRawFrame, TranscriptionFrame
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy
 
 import json
@@ -26,17 +25,20 @@ import time
 def update_lead_status(lead_id, status):
     logger.info(f"--- DATABASE UPDATE: LEAD {lead_id} STATUS -> {status} ---")
 
-_MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
+_MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None}
 _VAD_MODEL = {"value": None}
 
-# --- PERFORMANCE MONITORS ---
+# --- LATENCY MONITOR ---
 class MultimodalPerf(FrameProcessor):
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         if type(frame).__name__ == "TranscriptionFrame" and getattr(frame, "role", None) == "user":
              _MM["last_user_transcription_ts"] = time.monotonic()
         if type(frame).__name__ in {"BotStartedSpeakingFrame", "TTSStartedFrame"}:
-            _MM["last_bot_started_ts"] = time.monotonic()
+            now = time.monotonic()
+            _MM["last_bot_started_ts"] = now
+            if _MM["last_user_transcription_ts"]:
+                logger.info(f"⚡ Latency: {now - _MM['last_user_transcription_ts']:.3f}s")
         await self.push_frame(frame, direction)
 
 class MultimodalTranscriptRunTrigger(FrameProcessor):
@@ -54,7 +56,6 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
         try:
             await asyncio.sleep(self._delay_s)
             if self._queue_frames and self._last_user_transcript_ts == ts:
-                logger.info("Transcript idle -> Triggering LLM")
                 await self._queue_frames([LLMRunFrame()])
         except asyncio.CancelledError:
             pass
@@ -70,6 +71,7 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 # --- STRICT VOIP CHUNKER (20ms) ---
+# This ensures audio packets are exactly the size Telnyx expects, preventing "choppy" audio.
 class AudioFrameChunker(FrameProcessor):
     def __init__(self, *, chunk_ms: int = 20):
         super().__init__()
@@ -83,10 +85,7 @@ class AudioFrameChunker(FrameProcessor):
             channels = frame.num_channels
             bytes_per_sample = 2
             bytes_per_frame = channels * bytes_per_sample
-            # Exact number of bytes for the desired chunk duration
             target_bytes = int(sample_rate * self._chunk_ms / 1000) * bytes_per_frame
-            
-            # Align to frame boundary
             target_bytes = max(target_bytes - (target_bytes % bytes_per_frame), bytes_per_frame)
             
             if len(frame.audio) > target_bytes:
@@ -98,7 +97,6 @@ class AudioFrameChunker(FrameProcessor):
                     if not chunk: continue
                     await self.push_frame(frame_type(audio=chunk, sample_rate=sample_rate, num_channels=channels), direction)
                     if self._pace and not first:
-                        # Sleep exactly the duration of the chunk to simulate real-time stream
                         await asyncio.sleep(self._chunk_ms / 1000.0)
                     first = False
                 return
@@ -127,7 +125,8 @@ class AppointmentStatusTranscriptFallback(FrameProcessor):
         await self.push_frame(frame, direction)
 
 def normalize_gemini_live_model_name(model: str) -> str:
-    if not model or not model.strip(): return "models/gemini-2.0-flash-live-001"
+    # Force a fast model if input is questionable
+    if not model or not model.strip(): return "models/gemini-2.0-flash-exp"
     if "models/" not in model: return f"models/{model}"
     return model
 
@@ -142,9 +141,8 @@ async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
     except: pass
 
 async def run_bot(websocket_client, lead_data, call_control_id=None):
-    logger.info(f"Starting STABLE bot for lead: {lead_data['id']}")
+    logger.info(f"Starting FAST-PATH bot for lead: {lead_data['id']}")
     
-    # Keep pipeline at 16k for AI quality; Telnyx serializer will downsample to 8k automatically
     pipeline_sample_rate = 16000 
     stream_sample_rate = 8000
     
@@ -153,18 +151,13 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     inbound_encoding = "PCMU"
     
     try:
-        # Loop to find the stream ID and media format
         for _ in range(3):
             msg_text = await websocket_client.receive_text()
             msg = json.loads(msg_text)
-            
-            # Extract encoding if present
             if "media_format" in msg:
                 if msg["media_format"].get("encoding", "").upper() == "PCMA": inbound_encoding = "PCMA"
             elif "start" in msg:
                 if msg["start"].get("media_format", {}).get("encoding", "").upper() == "PCMA": inbound_encoding = "PCMA"
-            
-            # Extract Stream ID
             if "stream_id" in msg: 
                 stream_id = msg["stream_id"]
                 break
@@ -172,21 +165,20 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 if "stream_id" in msg: stream_id = msg["stream_id"]
                 break
     except Exception:
-        logger.warning("Handshake incomplete, proceeding with defaults")
+        pass
 
     # 1. Config
     customer_name = lead_data.get("customer_name") or "عزيزي"
     appointment_type = lead_data.get("appointment_type", "تنظيف وتبييض أسنان")
     appointment_time = lead_data.get("appointment_time", "بكرا الساعة 4 العصر")
 
-    # --- HIGH STABILITY VAD ---
-    # min_volume=0.8: Filters out almost all background noise/breath
-    # start_secs=0.5: User must speak for 0.5s before bot stops. Prevents "uh-huh" interruptions.
+    # --- FAST VAD ---
+    # Optimized for quick turn-taking while ignoring noise.
     vad = SileroVADAnalyzer(
         params=VADParams(
             min_volume=0.8, 
-            start_secs=0.5, 
-            stop_secs=0.8, 
+            start_secs=0.3, # Faster interruption detection
+            stop_secs=0.7, 
             confidence=0.75
         )
     )
@@ -214,16 +206,16 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
-    # 2. System Prompt
+    # 2. Optimized System Prompt
+    # Removed bulk. Key instruction: "Start speaking immediately."
     system_prompt = f"""
 # ROLE
-You are **Sara**, Treatment Coordinator at **"Elite Dental Clinic"** in Amman.
+You are **Sara**, from **"Elite Dental Clinic"** in Amman.
 Confirm appointment with {customer_name}.
 
 # TONE (Ammani Arabic)
-- Professional, Warm, Clear.
-- NO slang, NO Fusha.
-- Use "حضرتك", "يا هلا", "تمام".
+- Professional, Warm.
+- NO slang, NO Fusha. Use "حضرتك", "يا هلا".
 
 # CONTEXT
 - Treatment: {appointment_type}
@@ -231,17 +223,17 @@ Confirm appointment with {customer_name}.
 - Loc: Abdoun.
 
 # WORKFLOW
-1. **Greeting:** "مرحبا {customer_name}، معك سارة من عيادة إليت للأسنان. سامعني واضح؟"
-2. **Confirm:** "بأكد موعدك {appointment_time} لـ {appointment_type}. بانتظارك دكتور أسامة."
-3. **If Confirmed:** Tool `confirm_appointment` -> "ممتاز، نتشرف فيك."
-4. **If Cancel:** Tool `cancel_appointment` -> "ولا يهمك، بنرتب وقت تاني."
+1. **Greeting:** "مرحبا {customer_name}، معك سارة من عيادة إليت. سامعني؟"
+2. **Confirm:** "بأكد موعدك {appointment_time} لـ {appointment_type}."
+3. **If Confirmed:** Tool `confirm_appointment`.
+4. **If Cancel:** Tool `cancel_appointment`.
 
-# RULES
-- Speak immediately upon connection.
-- Keep sentences short.
+# CRITICAL RULES
+- START SPEAKING IMMEDIATELY upon connection.
+- Keep replies under 5 seconds.
 """
 
-    # 3. Gemini Service (STABILIZED)
+    # 3. Gemini Service (FAST START ENABLED)
     from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, InputParams
     
     gemini_live = GeminiLiveLLMService(
@@ -249,8 +241,8 @@ Confirm appointment with {customer_name}.
         voice_id=os.getenv("GEMINI_LIVE_VOICE") or "Aoede",
         system_instruction=system_prompt,
         params=InputParams(temperature=0.3),
-        # DISABLED to prevent 1008 Error. We trigger manually.
-        inference_on_context_initialization=False, 
+        # ENABLED: This makes the bot speak immediately without waiting for a trigger
+        inference_on_context_initialization=True, 
         model=normalize_gemini_live_model_name(os.getenv("GEMINI_LIVE_MODEL"))
     )
 
@@ -274,14 +266,11 @@ Confirm appointment with {customer_name}.
 
     # 5. Pipeline
     mm_perf = MultimodalPerf()
-    # Hidden context message to seed the conversation
-    mm_context = LLMContext(messages=[{"role": "user", "content": "Call connected. Greet the patient immediately."}])
+    # No hidden "Call connected" message. We rely on inference_on_context_initialization for speed.
+    mm_context = LLMContext(messages=[]) 
 
-    # --- TURN STRATEGIES ---
-    # Rely on the Strict VAD in the Transport for starting interruption
-    # Stop strategy: 0.8s timeout means we wait 0.8s of silence before assuming user is done.
     start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
-    stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=0.8)]
+    stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=0.7)]
     
     mm_aggregators = LLMContextAggregatorPair(
         mm_context,
@@ -292,7 +281,7 @@ Confirm appointment with {customer_name}.
 
     await gemini_live.set_context(mm_context)
 
-    transcript_trigger = MultimodalTranscriptRunTrigger(delay_s=0.7)
+    transcript_trigger = MultimodalTranscriptRunTrigger(delay_s=0.6)
     transcript_fallback = AppointmentStatusTranscriptFallback(
         lead_id=lead_data["id"],
         call_control_id=call_control_id,
@@ -309,7 +298,7 @@ Confirm appointment with {customer_name}.
             gemini_live,
             transcript_trigger,
             transcript_fallback,
-            audio_chunker, # Chunking before output is critical
+            audio_chunker,
             mm_perf,
             transport.output(),
             mm_aggregators.assistant(),
@@ -320,13 +309,4 @@ Confirm appointment with {customer_name}.
     transcript_trigger.set_queue_frames(task.queue_frames)
     
     runner = PipelineRunner()
-    
-    # --- FAST START ---
-    @transport.event_handler("on_client_connected")
-    async def _on_client_connected(_transport, _client):
-        # We manually trigger the run frame here.
-        # This is safer than inference_on_context_initialization=True
-        logger.info("Client connected. Triggering greeting manually.")
-        await task.queue_frames([LLMRunFrame()])
-
     await runner.run(task)
