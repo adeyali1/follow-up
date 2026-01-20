@@ -22,34 +22,26 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies, Transcription
 import json
 import time
 
-# --- MOCK SERVICE FOR STANDALONE TESTING ---
+# --- MOCK DB ---
 def update_lead_status(lead_id, status):
     logger.info(f"--- DATABASE UPDATE: LEAD {lead_id} STATUS -> {status} ---")
 
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
-BOT_BUILD_ID = "2026-01-20-dental-coordinator-v2-fixed"
 _VAD_MODEL = {"value": None}
 
-
+# --- PERFORMANCE LOGGING ---
 class MultimodalPerf(FrameProcessor):
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         frame_name = type(frame).__name__
-        if frame_name == "TranscriptionFrame":
-            try:
-                if getattr(frame, "role", None) == "user":
-                    _MM["last_user_transcription_ts"] = time.monotonic()
-            except Exception:
-                pass
+        if frame_name == "TranscriptionFrame" and getattr(frame, "role", None) == "user":
+             _MM["last_user_transcription_ts"] = time.monotonic()
         if frame_name in {"BotStartedSpeakingFrame", "TTSStartedFrame"}:
             now = time.monotonic()
             _MM["last_bot_started_ts"] = now
-            user_ts = _MM.get("last_user_transcription_ts")
-            if user_ts is not None:
-                logger.info(f"Latency multimodal user_transcription→bot_audio={now - user_ts:.3f}s")
         await self.push_frame(frame, direction)
 
-
+# --- RE-TRIGGER LOGIC (KEEPS CONVERSATION ALIVE) ---
 class MultimodalTranscriptRunTrigger(FrameProcessor):
     def __init__(self, *, delay_s: float):
         super().__init__()
@@ -64,54 +56,25 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
     async def _schedule(self, ts: float):
         try:
             await asyncio.sleep(self._delay_s)
+            if self._queue_frames and self._last_user_transcript_ts == ts:
+                await self._queue_frames([LLMRunFrame()])
         except asyncio.CancelledError:
-            return
-        if self._queue_frames is None:
-            return
-        if self._last_user_transcript_ts != ts:
-            return
-        logger.info("Multimodal: user transcript idle → LLMRunFrame")
-        _MM["last_llm_run_ts"] = time.monotonic()
-        await self._queue_frames([LLMRunFrame()])
-
-    def cancel_pending(self):
-        if self._pending is not None:
-            try:
-                self._pending.cancel()
-            except Exception:
-                pass
-            self._pending = None
+            pass
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and getattr(frame, "role", None) == "user":
-            is_final = True
-            try:
-                is_final = bool(getattr(frame, "is_final", True))
-            except Exception:
-                is_final = True
-            if not is_final:
-                await self.push_frame(frame, direction)
-                return
-            now = time.monotonic()
-            try:
-                text = (getattr(frame, "text", None) or "").strip()
-                if text:
-                    logger.debug(f"Multimodal: final user transcript received ({len(text)} chars)")
-            except Exception:
-                pass
-            self._last_user_transcript_ts = now
-            if self._pending is not None:
-                self._pending.cancel()
-            self._pending = asyncio.create_task(self._schedule(now))
+            if getattr(frame, "is_final", False):
+                now = time.monotonic()
+                self._last_user_transcript_ts = now
+                if self._pending: self._pending.cancel()
+                self._pending = asyncio.create_task(self._schedule(now))
         await self.push_frame(frame, direction)
 
-
 class MultimodalUserStopRunTrigger(FrameProcessor):
-    def __init__(self, *, delay_s: float = 0.05, min_interval_s: float = 0.25):
+    def __init__(self, *, delay_s: float = 0.05):
         super().__init__()
-        self._delay_s = float(delay_s)
-        self._min_interval_s = float(min_interval_s)
+        self._delay_s = delay_s
         self._queue_frames = None
         self._pending = None
         self._last_stop_ts = None
@@ -119,323 +82,139 @@ class MultimodalUserStopRunTrigger(FrameProcessor):
     def set_queue_frames(self, queue_frames):
         self._queue_frames = queue_frames
 
-    def cancel_pending(self):
-        if self._pending is not None:
-            try:
-                self._pending.cancel()
-            except Exception:
-                pass
-            self._pending = None
-
     async def _schedule(self, ts: float):
         try:
             await asyncio.sleep(self._delay_s)
+            if self._queue_frames and self._last_stop_ts == ts:
+                await self._queue_frames([LLMRunFrame()])
         except asyncio.CancelledError:
-            return
-        if self._queue_frames is None:
-            return
-        if self._last_stop_ts != ts:
-            return
-        last_run = _MM.get("last_llm_run_ts")
-        now = time.monotonic()
-        if last_run is not None and (now - last_run) < self._min_interval_s:
-            return
-        _MM["last_llm_run_ts"] = now
-        logger.info("Multimodal: user stop → LLMRunFrame")
-        await self._queue_frames([LLMRunFrame()])
+            pass
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         if type(frame).__name__ == "UserStoppedSpeakingFrame":
             now = time.monotonic()
             self._last_stop_ts = now
-            if self._pending is not None:
-                self._pending.cancel()
+            if self._pending: self._pending.cancel()
             self._pending = asyncio.create_task(self._schedule(now))
         await self.push_frame(frame, direction)
 
-
-class TurnStateLogger(FrameProcessor):
-    def __init__(self):
-        super().__init__()
-        self._user_turn_started_ts = None
-        self._logged_bot_audio = False
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-        frame_name = type(frame).__name__
-        if frame_name == "UserStartedSpeakingFrame":
-            self._user_turn_started_ts = time.monotonic()
-            logger.info("Turn: user started speaking")
-        elif frame_name == "UserStoppedSpeakingFrame":
-            now = time.monotonic()
-            dur = None
-            if self._user_turn_started_ts is not None:
-                dur = now - self._user_turn_started_ts
-            self._user_turn_started_ts = None
-            if dur is None:
-                logger.info("Turn: user stopped speaking")
-            else:
-                logger.info(f"Turn: user stopped speaking (dur={dur:.2f}s)")
-        elif frame_name in {"BotStartedSpeakingFrame", "TTSStartedFrame"} and not self._logged_bot_audio:
-            self._logged_bot_audio = True
-            logger.info(f"Turn: first bot audio started ({frame_name})")
-        await self.push_frame(frame, direction)
-
-
-class OutboundAudioLogger(FrameProcessor):
-    def __init__(self):
-        super().__init__()
-        self._logged = False
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-        if not self._logged and isinstance(frame, AudioRawFrame):
-            self._logged = True
-            try:
-                logger.info(f"AudioOut: first audio frame sr={frame.sample_rate} bytes={len(frame.audio)}")
-            except Exception:
-                logger.info("AudioOut: first audio frame")
-        await self.push_frame(frame, direction)
-
-
-class InboundAudioLogger(FrameProcessor):
-    def __init__(self):
-        super().__init__()
-        self._logged = False
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-        if not self._logged and isinstance(frame, InputAudioRawFrame):
-            self._logged = True
-            try:
-                logger.info(f"AudioInDecoded: first audio frame sr={frame.sample_rate} bytes={len(frame.audio)}")
-            except Exception:
-                logger.info("AudioInDecoded: first audio frame")
-        await self.push_frame(frame, direction)
-
-
+# --- AUDIO SMOOTHING (CRITICAL FOR QUALITY) ---
 class AudioFrameChunker(FrameProcessor):
-    def __init__(self, *, chunk_ms: int = 40):
+    def __init__(self, *, chunk_ms: int = 60): # Increased to 60ms for smoothness
         super().__init__()
-        self._chunk_ms = int(chunk_ms)
-        self._pace = (os.getenv("AUDIO_OUT_PACE") or "true").lower() == "true"
+        self._chunk_ms = chunk_ms
+        self._pace = True
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
-        if self._chunk_ms <= 0:
-            await self.push_frame(frame, direction)
-            return
-        if isinstance(frame, AudioRawFrame):
-            audio = frame.audio
-            if isinstance(audio, (bytes, bytearray)) and len(audio) > 0:
-                sample_rate = int(getattr(frame, "sample_rate", 0) or 0)
-                channels = int(getattr(frame, "num_channels", 1) or 1)
-                if sample_rate > 0 and channels > 0 and self._chunk_ms > 0:
-                    bytes_per_sample = 2
-                    bytes_per_frame = channels * bytes_per_sample
-                    chunk_bytes = int(sample_rate * self._chunk_ms / 1000) * bytes_per_frame
-                    chunk_bytes = max(chunk_bytes - (chunk_bytes % bytes_per_frame), bytes_per_frame)
-                    if len(audio) > chunk_bytes:
-                        frame_type = type(frame)
-                        first = True
-                        for i in range(0, len(audio), chunk_bytes):
-                            chunk = audio[i : i + chunk_bytes]
-                            if not chunk:
-                                continue
-                            try:
-                                await self.push_frame(
-                                    frame_type(audio=chunk, sample_rate=frame.sample_rate, num_channels=frame.num_channels),
-                                    direction,
-                                )
-                                if self._pace and not first:
-                                    await asyncio.sleep(self._chunk_ms / 1000)
-                            except Exception:
-                                await self.push_frame(frame, direction)
-                                return
-                            first = False
-                        return
+        if isinstance(frame, AudioRawFrame) and len(frame.audio) > 0:
+            sample_rate = frame.sample_rate
+            channels = frame.num_channels
+            bytes_per_sample = 2
+            bytes_per_frame = channels * bytes_per_sample
+            chunk_bytes = int(sample_rate * self._chunk_ms / 1000) * bytes_per_frame
+            # Align to frame boundary
+            chunk_bytes = max(chunk_bytes - (chunk_bytes % bytes_per_frame), bytes_per_frame)
+            
+            if len(frame.audio) > chunk_bytes:
+                audio = frame.audio
+                frame_type = type(frame)
+                first = True
+                for i in range(0, len(audio), chunk_bytes):
+                    chunk = audio[i : i + chunk_bytes]
+                    if not chunk: continue
+                    await self.push_frame(frame_type(audio=chunk, sample_rate=sample_rate, num_channels=channels), direction)
+                    if self._pace and not first:
+                        await asyncio.sleep(self._chunk_ms / 1000.0)
+                    first = False
+                return
         await self.push_frame(frame, direction)
 
-
+# --- FALLBACK TRANSCRIPT ANALYSIS ---
 class AppointmentStatusTranscriptFallback(FrameProcessor):
-    def __init__(self, *, lead_id: str, call_control_id: str | None, call_end_delay_s: float, finalized_ref: dict):
+    def __init__(self, *, lead_id: str, call_control_id: str | None, finalized_ref: dict):
         super().__init__()
         self._lead_id = lead_id
         self._call_control_id = call_control_id
-        self._call_end_delay_s = float(call_end_delay_s)
         self._finalized_ref = finalized_ref
 
     @staticmethod
-    def _normalize(text: str) -> str:
-        text = (text or "").strip().lower()
-        for ch in ["\n", "\r", "\t", ".", ",", "!", "?", "؟", "،", "؛", "\"", "'"]:
-            text = text.replace(ch, " ")
-        while "  " in text:
-            text = text.replace("  ", " ")
-        return text
-
-    @staticmethod
     def _is_confirm(text: str) -> bool:
-        t = AppointmentStatusTranscriptFallback._normalize(text)
-        if not t:
-            return False
-        if any(x in t for x in ["الغ", "كنسل", "cancel", "مش جاي", "ما بقدر", "صعبة", "لا"]):
-            return False
-        return any(
-            x in t
-            for x in [
-                "تمام", "ماشي", "أكيد", "اكيد", "موافق", "ان شاء الله", "إن شاء الله",
-                "جاي", "بكون موجود", "تم", "اوكي", "ok", "yes", "confirm", "100"
-            ]
-        )
-
-    @staticmethod
-    def _is_cancel(text: str) -> bool:
-        t = AppointmentStatusTranscriptFallback._normalize(text)
-        if not t:
-            return False
-        return any(x in t for x in ["الغ", "إلغاء", "الغاء", "كنسل", "cancel", "مش رح اقدر", "ما بقدر", "اجل", "أجل"])
+        t = text.lower()
+        if any(x in t for x in ["cancel", "no", "لا", "ما بدي", "الغ"]): return False
+        return any(x in t for x in ["تمام", "ماشي", "أكيد", "موافق", "ان شاء الله", "جاي", "ok", "yes", "confirm"])
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame) and getattr(frame, "role", None) == "user":
-            try:
-                if self._finalized_ref.get("value"):
-                    await self.push_frame(frame, direction)
-                    return
-            except Exception:
-                pass
-            is_final = True
-            try:
-                is_final = bool(getattr(frame, "is_final", True))
-            except Exception:
-                is_final = True
-            if is_final:
-                text = ""
-                try:
-                    text = str(getattr(frame, "text", "") or "")
-                except Exception:
-                    text = ""
+        if isinstance(frame, TranscriptionFrame) and getattr(frame, "role", None) == "user" and getattr(frame, "is_final", False):
+            if not self._finalized_ref.get("value"):
+                text = getattr(frame, "text", "") or ""
                 if self._is_confirm(text):
-                    logger.info("Fallback: detected confirmation from transcript")
-                elif self._is_cancel(text):
-                    logger.info("Fallback: detected cancellation from transcript")
+                    logger.info("Fallback: Transcript indicates confirmation.")
         await self.push_frame(frame, direction)
 
-
+# --- UTILS ---
 def normalize_gemini_live_model_name(model: str) -> str:
-    model = (model or "").strip()
-    if not model:
-        # Defaulting to a stable live model
-        return "models/gemini-2.0-flash-live-001"
-    if model.startswith("models/"):
-        return model
-    if "/" in model:
-        return model
-    return f"models/{model}"
-
-
-def normalize_customer_name_for_ar(name: str) -> str:
-    raw = (name or "").strip()
-    if not raw:
-        return raw
-    return raw
-
+    if not model or not model.strip(): return "models/gemini-2.0-flash-live-001"
+    if "models/" not in model: return f"models/{model}"
+    return model
 
 async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
-    if not call_control_id:
-        return
-    telnyx_key = os.getenv("TELNYX_API_KEY")
-    if not telnyx_key:
-        return
-    if delay_s > 0:
-        await asyncio.sleep(delay_s)
-    encoded_call_control_id = quote(call_control_id, safe="")
-    url = f"https://api.telnyx.com/v2/calls/{encoded_call_control_id}/actions/hangup"
-    headers = {"Authorization": f"Bearer {telnyx_key}", "Content-Type": "application/json"}
+    if not call_control_id or not os.getenv("TELNYX_API_KEY"): return
+    if delay_s > 0: await asyncio.sleep(delay_s)
+    url = f"https://api.telnyx.com/v2/calls/{quote(call_control_id, safe='')}/actions/hangup"
+    headers = {"Authorization": f"Bearer {os.getenv('TELNYX_API_KEY')}", "Content-Type": "application/json"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json={"reason": "normal_clearing"}) as resp:
-                if resp.status >= 300:
-                    await resp.text()
-    except Exception:
-        return
+            async with session.post(url, headers=headers, json={"reason": "normal_clearing"}): pass
+    except: pass
 
+# --- MAIN BOT LOGIC ---
 async def run_bot(websocket_client, lead_data, call_control_id=None):
-    logger.info(f"Starting DENTAL bot for lead: {lead_data['id']}")
+    logger.info(f"Starting CRYSTAL CLEAR bot for lead: {lead_data['id']}")
     
-    _MM["last_user_transcription_ts"] = None
-    _MM["last_bot_started_ts"] = None
-    _MM["last_llm_run_ts"] = None
+    pipeline_sample_rate = 16000 # Keep 16k for AI quality
+    stream_sample_rate = 8000 # Telnyx standard
     
-    pipeline_sample_rate = 16000
-    try:
-        pipeline_sample_rate = int(os.getenv("PIPELINE_SAMPLE_RATE") or os.getenv("GEMINI_LIVE_SAMPLE_RATE") or 16000)
-    except Exception:
-        pipeline_sample_rate = 16000
-
-    # ------------------------------------------------------------------
-    # 0. Handle Telnyx Handshake
-    # ------------------------------------------------------------------
+    # 0. Telnyx Handshake
     stream_id = "telnyx_stream_placeholder"
     inbound_encoding = "PCMU"
-    stream_sample_rate = 8000
+    
     try:
-        logger.info("Waiting for Telnyx 'start' event with stream_id...")
-        for _ in range(3): 
+        for _ in range(3):
             msg_text = await websocket_client.receive_text()
-            logger.info(f"Received Telnyx message: {msg_text}")
             msg = json.loads(msg_text)
-            
             if "media_format" in msg:
-                 encoding = msg["media_format"].get("encoding", "").upper()
-                 stream_sample_rate = int(msg["media_format"].get("sample_rate", stream_sample_rate) or stream_sample_rate)
-                 if encoding == "PCMA":
-                     inbound_encoding = "PCMA"
-                 elif encoding == "PCMU":
-                     inbound_encoding = "PCMU"
-
-            elif "start" in msg and "media_format" in msg["start"]:
-                 encoding = msg["start"]["media_format"].get("encoding", "").upper()
-                 stream_sample_rate = int(msg["start"]["media_format"].get("sample_rate", stream_sample_rate) or stream_sample_rate)
-                 if encoding == "PCMA":
-                     inbound_encoding = "PCMA"
-                 elif encoding == "PCMU":
-                     inbound_encoding = "PCMU"
-
-            if "stream_id" in msg:
+                if msg["media_format"].get("encoding", "").upper() == "PCMA": inbound_encoding = "PCMA"
+            elif "start" in msg:
+                if msg["start"].get("media_format", {}).get("encoding", "").upper() == "PCMA": inbound_encoding = "PCMA"
+            
+            if "stream_id" in msg: 
                 stream_id = msg["stream_id"]
                 break
-            elif "data" in msg and "stream_id" in msg["data"]:
-                stream_id = msg["data"]["stream_id"]
+            if msg.get("event") == "start":
+                if "stream_id" in msg: stream_id = msg["stream_id"]
                 break
-            elif msg.get("event") == "start":
-                 if "stream_id" in msg:
-                      stream_id = msg["stream_id"]
-                      break
-            
-    except Exception as e:
-        logger.error(f"Failed to capture stream_id from initial message: {e}")
+    except Exception:
+        logger.warning("Handshake issue, proceeding with defaults")
 
-    # ------------------------------------------------------------------
-    # 1. Dental Coordinator Config
-    # ------------------------------------------------------------------
-    customer_name = normalize_customer_name_for_ar(lead_data.get("customer_name") or "عزيزي")
+    # 1. Config
+    customer_name = lead_data.get("customer_name") or "عزيزي"
     appointment_type = lead_data.get("appointment_type", "تنظيف وتبييض أسنان")
     appointment_time = lead_data.get("appointment_time", "بكرا الساعة 4 العصر")
 
-    vad_stop_secs = 0.4
-    vad_min_volume = 0.6
-    vad = None
-    cached_vad = _VAD_MODEL.get("value")
-    if cached_vad is None:
-        vad = SileroVADAnalyzer(
-            params=VADParams(min_volume=vad_min_volume, start_secs=0.2, stop_secs=vad_stop_secs, confidence=0.7)
+    # --- TUNED VAD FOR NOISE IMMUNITY ---
+    # increased min_volume to 0.8 (filters background noise)
+    # increased start_secs to 0.3 (filters quick random sounds)
+    vad = SileroVADAnalyzer(
+        params=VADParams(
+            min_volume=0.8, 
+            start_secs=0.3, 
+            stop_secs=0.8, 
+            confidence=0.75
         )
-        _VAD_MODEL["value"] = vad
-    else:
-        vad = cached_vad
+    )
 
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
@@ -460,120 +239,72 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
-    # ------------------------------------------------------------------
     # 2. System Prompt
-    # ------------------------------------------------------------------
     system_prompt = f"""
 # ROLE
-You are **Sara**, the Treatment Coordinator at **"Elite Dental Clinic"** (عيادة إليت للأسنان) in Amman, Jordan.
-You are calling to confirm an upcoming appointment. This is a high-end, professional clinic.
+You are **Sara**, Treatment Coordinator at **"Elite Dental Clinic"** in Amman.
+Confirm appointment with {customer_name}.
 
-# DIALECT (JORDANIAN - AMMANI)
-- Speak educated, warm, professional Ammani Arabic.
-- Use polite terms: "حضرتك", "أهلا وسهلا", "تمام", "يا هلا".
-- Avoid slang or overly street language. Avoid classical Fusha (don't say "سوف" or "لماذا").
-- Use English medical terms if natural (e.g., "Check-up", "Whitening" is okay if the user understands), but stick to Arabic mostly.
+# TONE (Ammani Arabic)
+- Professional, Warm, Clear.
+- NO slurring, NO slang, NO Fusha.
+- Use "حضرتك", "يا هلا", "تمام".
 
 # CONTEXT
-- Patient Name: {customer_name}
 - Treatment: {appointment_type}
 - Time: {appointment_time}
-- Location: Abdoun, near the Embassy.
-- Parking: Valet is available.
+- Loc: Abdoun.
 
 # WORKFLOW
-1. **Greeting:**
-   - Your FIRST and IMMEDIATE response must be: "مرحبا {customer_name}، معك سارة من عيادة إليت للأسنان. سامعني واضح؟"
-   - Wait for them to say "Yes" or "Ah".
-2. **Confirmation:**
-   - "حبيت أأكد موعدك {appointment_time} عشان {appointment_type}. بانتظارك دكتور أسامة."
-3. **If Confirmed:**
-   - Call function `confirm_appointment`.
-   - Say: "ممتاز! يا ريت لو تيجوا قبل 10 دقايق عشان الإجراءات. بتشرفونا."
-   - End politeley.
-4. **If they want to Cancel/Reschedule:**
-   - Show empathy.
-   - Call function `cancel_appointment` (or ask when they want to move it).
-   - Say: "ولا يهمك، بخلي قسم المواعيد يتواصل معك لترتيب وقت تاني. شكراً إلك."
-5. **Handling Questions:**
-   - **Price:** "الكشفية 20 دينار، والعلاج حسب الحالة الدكتور بحددلك."
-   - **Location:** "احنا بعبدون، قرب السفارة. وفي فاليت لسيارتك."
+1. **Greeting:** "مرحبا {customer_name}، معك سارة من عيادة إليت للأسنان. سامعني واضح؟" (Wait for reply).
+2. **Confirm:** "بأكد موعدك {appointment_time} لـ {appointment_type}. بانتظارك دكتور أسامة."
+3. **If Confirmed:** Call tool `confirm_appointment` -> "ممتاز، نتشرف فيك."
+4. **If Cancel:** Call tool `cancel_appointment` -> "ولا يهمك، بنرتب وقت تاني."
 
-# CRITICAL
-- Do NOT be silent at the start. Speak the greeting immediately.
+# RULES
+- Speak immediately.
+- Short sentences.
 """
 
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        logger.error("GOOGLE_API_KEY is missing.")
-        return
-
-    # ------------------------------------------------------------------
-    # 3. Gemini Live Setup (FIXED)
-    # ------------------------------------------------------------------
-    from pipecat.services.google.gemini_live.llm import (
-        GeminiLiveLLMService as GeminiLiveService,
-        InputParams as GeminiLiveInputParams,
+    # 3. Gemini Service
+    from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, InputParams
+    
+    gemini_live = GeminiLiveLLMService(
+        api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
+        voice_id=os.getenv("GEMINI_LIVE_VOICE") or "Aoede",
+        system_instruction=system_prompt,
+        params=InputParams(temperature=0.3),
+        inference_on_context_initialization=True,
+        model=normalize_gemini_live_model_name(os.getenv("GEMINI_LIVE_MODEL"))
     )
-    
-    model_env = os.getenv("GEMINI_LIVE_MODEL")
-    model = normalize_gemini_live_model_name(model_env)
-    voice_id = os.getenv("GEMINI_LIVE_VOICE") or "Aoede" 
 
-    gemini_params = GeminiLiveInputParams(temperature=0.3)
-    
-    # --- FIX START ---
-    # DO NOT set gemini_params.language = Language.AR here.
-    # Leaving it empty allows Gemini Live to negotiate the connection correctly.
-    # The System Prompt is sufficient to make it speak Arabic.
-    # --- FIX END ---
-
-    gemini_kwargs = {
-        "api_key": api_key,
-        "voice_id": voice_id,
-        "system_instruction": system_prompt,
-        "params": gemini_params,
-        "inference_on_context_initialization": True, # This tells it to generate audio immediately upon connection
-        "model": model
-    }
-    
-    gemini_live = GeminiLiveService(**gemini_kwargs)
-
-    call_end_delay_s = 2.0
     lead_finalized = {"value": None}
 
-    # ------------------------------------------------------------------
-    # 4. Functions
-    # ------------------------------------------------------------------
+    # 4. Tools
     async def confirm_appointment(params: FunctionCallParams):
-        logger.info(f"TOOL: Confirming appointment for {lead_data['id']}")
         lead_finalized["value"] = "CONFIRMED"
         update_lead_status(lead_data["id"], "CONFIRMED")
-        await params.result_callback({"status": "success", "msg": "Appointment confirmed."})
-        if call_control_id:
-             asyncio.create_task(hangup_telnyx_call(call_control_id, 4.0))
+        await params.result_callback({"status": "success"})
+        if call_control_id: asyncio.create_task(hangup_telnyx_call(call_control_id, 3.0))
 
     async def cancel_appointment(params: FunctionCallParams):
-        logger.info(f"TOOL: Cancelling appointment for {lead_data['id']}")
         lead_finalized["value"] = "CANCELLED"
-        reason = params.arguments.get("reason", "Patient request")
         update_lead_status(lead_data["id"], "CANCELLED")
-        await params.result_callback({"status": "cancelled", "reason": reason})
-        if call_control_id:
-             asyncio.create_task(hangup_telnyx_call(call_control_id, 4.0))
+        await params.result_callback({"status": "cancelled"})
+        if call_control_id: asyncio.create_task(hangup_telnyx_call(call_control_id, 3.0))
 
     gemini_live.register_function("confirm_appointment", confirm_appointment)
     gemini_live.register_function("cancel_appointment", cancel_appointment)
 
-    # ------------------------------------------------------------------
     # 5. Pipeline
-    # ------------------------------------------------------------------
     mm_perf = MultimodalPerf()
-    # Initial message to force the LLM to start logic
-    mm_context = LLMContext(messages=[{"role": "user", "content": "Call connected. Say the greeting to Oday."}])
+    # Hidden context message to seed the conversation
+    mm_context = LLMContext(messages=[{"role": "user", "content": "Call connected. Greet the patient immediately."}])
 
+    # --- TURN STRATEGIES (STRICTER) ---
+    # Using Transcription Strategy but relying on the stricter VAD settings passed to Transport
     start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
-    stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=0.6)]
+    stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=0.8)] # Increased timeout to prevent cutting user off
     
     mm_aggregators = LLMContextAggregatorPair(
         mm_context,
@@ -582,32 +313,31 @@ You are calling to confirm an upcoming appointment. This is a high-end, professi
         ),
     )
 
-    try:
-        await gemini_live.set_context(mm_context)
-    except Exception:
-        pass
+    await gemini_live.set_context(mm_context)
 
+    # Triggers
     transcript_trigger = MultimodalTranscriptRunTrigger(delay_s=0.7)
     transcript_fallback = AppointmentStatusTranscriptFallback(
         lead_id=lead_data["id"],
         call_control_id=call_control_id,
-        call_end_delay_s=call_end_delay_s,
         finalized_ref=lead_finalized,
     )
-    user_stop_trigger = MultimodalUserStopRunTrigger(delay_s=0.1, min_interval_s=0.5)
+    # Less aggressive user stop trigger
+    user_stop_trigger = MultimodalUserStopRunTrigger(delay_s=0.2)
     
+    # --- SMOOTHING ---
+    # Increased chunk_ms to 60 for better audio stability over network
+    audio_chunker = AudioFrameChunker(chunk_ms=60)
+
     pipeline = Pipeline(
         [
             transport.input(),
-            InboundAudioLogger(),
             mm_aggregators.user(),
             user_stop_trigger,
             gemini_live,
             transcript_trigger,
             transcript_fallback,
-            TurnStateLogger(),
-            OutboundAudioLogger(),
-            AudioFrameChunker(chunk_ms=20),
+            audio_chunker, # Chunking before output
             mm_perf,
             transport.output(),
             mm_aggregators.assistant(),
@@ -620,22 +350,12 @@ You are calling to confirm an upcoming appointment. This is a high-end, professi
     
     runner = PipelineRunner()
     
-    call_alive = {"value": True}
-
-    @transport.event_handler("on_client_disconnected")
-    async def _on_client_disconnected(_transport, _client):
-        call_alive["value"] = False
-        transcript_trigger.cancel_pending()
-        user_stop_trigger.cancel_pending()
-
-    # Safety kicker: If bot doesn't speak in 2 seconds, force it.
-    async def kickstart_conversation():
-        await asyncio.sleep(2.0)
-        if not _MM.get("last_bot_started_ts") and call_alive["value"]:
-            logger.info("Bot silent at start, triggering LLM...")
-            # Pushing a run frame forces the LLM to look at the context and generate
-            await task.queue_frames([LLMRunFrame()])
-
-    asyncio.create_task(kickstart_conversation())
+    # --- FAST START LOGIC ---
+    @transport.event_handler("on_client_connected")
+    async def _on_client_connected(_transport, _client):
+        # As soon as audio connects, force the LLM to run. 
+        # This is faster than waiting for a silence timeout.
+        logger.info("Client connected. Triggering greeting immediately.")
+        await task.queue_frames([LLMRunFrame()])
 
     await runner.run(task)
