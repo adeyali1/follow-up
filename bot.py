@@ -96,6 +96,92 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class LeadStatusTranscriptFallback(FrameProcessor):
+    def __init__(self, *, lead_id: str, call_control_id: str | None, call_end_delay_s: float, finalized_ref: dict):
+        super().__init__()
+        self._lead_id = lead_id
+        self._call_control_id = call_control_id
+        self._call_end_delay_s = float(call_end_delay_s)
+        self._finalized_ref = finalized_ref
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        text = (text or "").strip().lower()
+        for ch in ["\n", "\r", "\t", ".", ",", "!", "?", "؟", "،", "؛", "\"", "'"]:
+            text = text.replace(ch, " ")
+        while "  " in text:
+            text = text.replace("  ", " ")
+        return text
+
+    @staticmethod
+    def _is_confirm(text: str) -> bool:
+        t = LeadStatusTranscriptFallback._normalize(text)
+        if not t:
+            return False
+        if any(x in t for x in ["الغ", "كنسل", "cancel", "مش بد", "مش بدي", "لا بدي", "إلغاء", "الغاء"]):
+            return False
+        if "مش" in t and any(x in t for x in ["تمام", "ماشي", "موافق"]):
+            return False
+        return any(
+            x in t
+            for x in [
+                "تمام",
+                "ماشي",
+                "أكيد",
+                "اكيد",
+                "موافق",
+                "اوكي",
+                "okay",
+                "ok",
+                "yes",
+                "بنعم",
+                "اه",
+                "أه",
+            ]
+        )
+
+    @staticmethod
+    def _is_cancel(text: str) -> bool:
+        t = LeadStatusTranscriptFallback._normalize(text)
+        if not t:
+            return False
+        return any(x in t for x in ["الغ", "إلغاء", "الغاء", "كنسل", "cancel", "مش بد", "مش بدي"])
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame) and getattr(frame, "role", None) == "user":
+            try:
+                if self._finalized_ref.get("value"):
+                    await self.push_frame(frame, direction)
+                    return
+            except Exception:
+                pass
+            is_final = True
+            try:
+                is_final = bool(getattr(frame, "is_final", True))
+            except Exception:
+                is_final = True
+            if is_final:
+                text = ""
+                try:
+                    text = str(getattr(frame, "text", "") or "")
+                except Exception:
+                    text = ""
+                if self._is_confirm(text):
+                    self._finalized_ref["value"] = "CONFIRMED"
+                    logger.info("Fallback: detected confirmation from transcript; updating lead status CONFIRMED")
+                    update_lead_status(self._lead_id, "CONFIRMED")
+                    if self._call_control_id:
+                        asyncio.create_task(hangup_telnyx_call(self._call_control_id, self._call_end_delay_s))
+                elif self._is_cancel(text):
+                    self._finalized_ref["value"] = "CANCELLED"
+                    logger.info("Fallback: detected cancellation from transcript; updating lead status CANCELLED")
+                    update_lead_status(self._lead_id, "CANCELLED")
+                    if self._call_control_id:
+                        asyncio.create_task(hangup_telnyx_call(self._call_control_id, self._call_end_delay_s))
+        await self.push_frame(frame, direction)
+
+
 def normalize_gemini_live_model_name(model: str) -> str:
     model = (model or "").strip()
     if not model:
@@ -109,12 +195,7 @@ def normalize_gemini_live_model_name(model: str) -> str:
 
 def build_multimodal_opening_message(greeting_text: str) -> str:
     greeting_text = (greeting_text or "").strip()
-    return (
-        "ابدأ المكالمة هلّق. أول جملة تحكيها لازم تكون EXACTLY هالنص بدون أي تغيير:\n"
-        f"\"{greeting_text}\"\n"
-        "بعد ما تحكي هاي الجملة، اسكت واستنى رد الزبون. لا تكمل ولا تحكي تفاصيل الطلب قبل ما يرد.\n"
-        "لما يرد، احكيله عن الطلب والوقت وبسؤال واحد قصير للتأكيد."
-    )
+    return greeting_text
 
 
 class AudioSampleRateResampler(FrameProcessor):
@@ -273,39 +354,36 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
-    opening_rule = (
-        "- The opening line is NOT delivered yet. You must say the opening line yourself."
-        if use_multimodal_live
-        else "- The opening line is already delivered by the system TTS. Do NOT repeat it."
-    )
-
     system_prompt = f"""
-# IDENTITY
-You are "Khalid", a professional, polite, and native Jordanian delivery coordinator from "Kawkab Delivery" (شركة كوكب للتوصيل).
-Your goal is to confirm delivery details with customers in a way that feels 100% human and local to Amman, Jordan.
+# ROLE
+You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Delivery\" in Amman, Jordan. This is a live phone conversation. Your goal is to be helpful, crisp, and sound 100% like a polite Jordanian man.
 
-# PERSONALITY & TONE
-- **Voice**: Friendly, energetic, and "Ibn Nas" (well-mannered).
-- **Style**: Use the Ammani/Urban Jordanian dialect.
-- **Efficiency**: Jordanians appreciate quick calls. Keep responses under 10 words unless explaining something.
-- **Rules**: Never speak Formal Arabic (Fusha). Never speak English unless the customer starts in English.
-- **Jordanian Only**: If you catch yourself using non-Jordanian words, immediately rephrase in Jordanian.
+# VOCAL PERSONALITY & TONE (CRITICAL FOR LIVE API)
+- Voice Tone: Warm, energetic, and professional.
+- Pacing: Speak at a natural human speed. Do not rush, but do not drone.
+- Vocalisms: Use natural Jordanian fillers like \"تمام\", \"يا هلا\", \"طيب\" to show you are listening.
+- Emotion: If the customer is happy, be warm. If they are in a hurry, be faster and more efficient.
 
-# OPENING
-{opening_rule}
+# LANGUAGE & DIALECT (WHITE JORDANIAN)
+- Primary Dialect: Educated Ammani (White Arabic).
+- Phonetics: Use the soft 'G' for 'Qaf' in casual words, but keep the clear 'Q' for professional words like \"تأكيد\".
+- Forbidden Words: NEVER use Fusha words like \"ماذا\", \"هل ترغب\", \"سوف\", or \"السائق\".
+- Preferred Words: Use \"بدي\", \"المندوب\", \"عشان\", \"هسا\".
+- Local Courtesy: Use \"غلبناك معنا\" and \"على راسي\" to build trust.
 
-# DIALECT GUIDELINES
-- Use "G" for "Qaf" (e.g., 'Galleh' for 'Qalleh').
-- Use local fillers: "يا هلا والله", "أبشر", "من عيوني", "عشان هيك", "هسا", "مية مية".
-- Prefer Jordanian words: "شو" بدل "ماذا", "ليش" بدل "لماذا", "هسا" بدل "الآن", "بدك" بدل "تريد".
-- If they say "Yes/Okay": Respond with "ممتاز، أبشر" or "مية مية، هسا برتب مع الشوفير".
-- If they say "No/Cancel": Respond with "ولا يهمك، حصل خير. بس بقدر أعرف شو السبب للإلغاء؟".
+# LIVE CONVERSATION LOGIC
+- Turn-Taking: If the user interrupts you, STOP talking immediately and listen.
+- Greeting State: If the user says \"Hello\" or \"Salam\" first, do NOT repeat your full intro. Just say: \"يا هلا والله، معك خالد... بس كنت حاب أتأكد من طلبك...\".
+- Silence Handling: If the user is silent for too long, ask politely: \"معي يا غالي؟\" or \"ألو؟ عدي معي؟\".
+- Brevity: Phone calls are expensive and users are busy. Keep 90% of your responses under 10 words.
 
-# LOGIC & TOOLS
-1. **Confirmation**: If they agree, call `update_lead_status_confirmed` and then say: "تمام، هسا بنرتب الأمور ويوصلك على الموعد إن شاء الله. مع السلامة."
-2. **Cancellation**: If they cancel, call `update_lead_status_cancelled` and then say: "تم، لغينا الطلب. يومك سعيد، مع السلامة."
-3. **Handling Interruption**: If the user says "Hello?" or "Are you there?" (ألو / معك؟ / وينك؟ / سلام عليكم / السلام عليكم), respond immediately with: "معك معك، تفضل..." and do NOT repeat the full introduction.
-4. **Tool Safety**: Never confirm or cancel based on greetings or unclear words. Ask 1 short question if unclear.
+# GREETING RULE (IMPORTANT)
+- Your very first spoken line must match the prepared greeting message in the conversation context (assistant message). Say it once, then wait for the customer.
+
+# TASK WORKFLOW
+1. Confirm: \"عدي، طلبك {lead_data['order_items']} رح يوصل ع الساعة {lead_data['delivery_time']}. بنعتمد؟\"
+2. Success: If confirmed, call update_lead_status_confirmed immediately, then say: \"مية مية، هسا برتب مع المندوب ويوصلك ع الموعد. غلبناك!\"
+3. Cancellation: If they cancel, call update_lead_status_cancelled immediately, then say: \"ولا يهمك، حصل خير. لغينا الطلب وبنتمنى نخدمك مرة تانية.\"
 
 # CONTEXT
 - Customer: {lead_data['customer_name']}
@@ -374,7 +452,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                 "voice_id": voice_id,
                 "system_instruction": system_prompt,
                 "params": gemini_params,
-                "inference_on_context_initialization": True,
+                "inference_on_context_initialization": False,
             }
             if model:
                 gemini_kwargs["model"] = model
@@ -388,9 +466,11 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             call_end_delay_s = float(os.getenv("CALL_END_DELAY_S") or 2.5)
         except Exception:
             call_end_delay_s = 2.5
+        lead_finalized = {"value": None}
 
         async def confirm_order(params: FunctionCallParams):
             logger.info(f"Confirming order for lead {lead_data['id']}")
+            lead_finalized["value"] = "CONFIRMED"
             reason = None
             try:
                 reason = params.arguments.get("reason")
@@ -403,6 +483,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
 
         async def cancel_order(params: FunctionCallParams):
             logger.info(f"Cancelling order for lead {lead_data['id']}")
+            lead_finalized["value"] = "CANCELLED"
             reason = None
             try:
                 reason = params.arguments.get("reason")
@@ -427,8 +508,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         mm_perf = MultimodalPerf()
         logger.info(f"Multimodal resamplers: in {stream_sample_rate}->{gemini_in_sample_rate}, out {gemini_in_sample_rate}->{stream_sample_rate}")
 
-        opening_message = build_multimodal_opening_message(greeting_text)
-        mm_context = LLMContext(messages=[{"role": "user", "content": opening_message}])
+        mm_context = LLMContext(messages=[{"role": "assistant", "content": greeting_text}])
         user_mute_strategies = []
         mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "false").lower() == "true"
         if mute_first_bot:
@@ -487,6 +567,12 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
         except Exception:
             transcript_run_delay_s = 0.7
         transcript_trigger = MultimodalTranscriptRunTrigger(delay_s=transcript_run_delay_s)
+        transcript_fallback = LeadStatusTranscriptFallback(
+            lead_id=lead_data["id"],
+            call_control_id=call_control_id,
+            call_end_delay_s=call_end_delay_s,
+            finalized_ref=lead_finalized,
+        )
 
         pipeline = Pipeline(
             [
@@ -495,6 +581,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                 input_resampler,
                 gemini_live,
                 transcript_trigger,
+                transcript_fallback,
                 mm_perf,
                 output_resampler,
                 transport.output(),
@@ -512,7 +599,7 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
             if did_trigger_initial_run["value"]:
                 return
             did_trigger_initial_run["value"] = True
-            logger.info("Multimodal: client connected, triggering LLMRunFrame")
+            logger.info("Multimodal: client connected, triggering initial LLMRunFrame")
             await task.queue_frames([LLMRunFrame()])
 
         async def multimodal_first_turn_failsafe():
@@ -575,9 +662,12 @@ Your goal is to confirm delivery details with customers in a way that feels 100%
                     ]
                 )
 
-        asyncio.create_task(multimodal_stuck_watchdog())
-        asyncio.create_task(multimodal_silent_start_retry())
-        asyncio.create_task(multimodal_first_turn_failsafe())
+        if (os.getenv("MULTIMODAL_ENABLE_START_RETRY") or "false").lower() == "true":
+            asyncio.create_task(multimodal_silent_start_retry())
+        if (os.getenv("MULTIMODAL_ENABLE_FIRST_TURN_FAILSAFE") or "false").lower() == "true":
+            asyncio.create_task(multimodal_first_turn_failsafe())
+        if (os.getenv("MULTIMODAL_ENABLE_STUCK_WATCHDOG") or "true").lower() == "true":
+            asyncio.create_task(multimodal_stuck_watchdog())
         await runner.run(task)
         return
     logger.error("Classic STT/Vertex/TTS pipeline has been removed. Set USE_MULTIMODAL_LIVE=true.")
