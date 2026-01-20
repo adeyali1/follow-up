@@ -24,7 +24,7 @@ from services.supabase_service import update_lead_status
 import json
 import time
 
-_MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None}
+_MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
 BOT_BUILD_ID = "2026-01-20-multimodal-llmrunframe"
 _VAD_MODEL = {"value": None}
 
@@ -69,7 +69,16 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
         if self._last_user_transcript_ts != ts:
             return
         logger.info("Multimodal: user transcript idle → LLMRunFrame")
+        _MM["last_llm_run_ts"] = time.monotonic()
         await self._queue_frames([LLMRunFrame()])
+
+    def cancel_pending(self):
+        if self._pending is not None:
+            try:
+                self._pending.cancel()
+            except Exception:
+                pass
+            self._pending = None
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -90,6 +99,54 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
             except Exception:
                 pass
             self._last_user_transcript_ts = now
+            if self._pending is not None:
+                self._pending.cancel()
+            self._pending = asyncio.create_task(self._schedule(now))
+        await self.push_frame(frame, direction)
+
+
+class MultimodalUserStopRunTrigger(FrameProcessor):
+    def __init__(self, *, delay_s: float = 0.05, min_interval_s: float = 0.25):
+        super().__init__()
+        self._delay_s = float(delay_s)
+        self._min_interval_s = float(min_interval_s)
+        self._queue_frames = None
+        self._pending = None
+        self._last_stop_ts = None
+
+    def set_queue_frames(self, queue_frames):
+        self._queue_frames = queue_frames
+
+    def cancel_pending(self):
+        if self._pending is not None:
+            try:
+                self._pending.cancel()
+            except Exception:
+                pass
+            self._pending = None
+
+    async def _schedule(self, ts: float):
+        try:
+            await asyncio.sleep(self._delay_s)
+        except asyncio.CancelledError:
+            return
+        if self._queue_frames is None:
+            return
+        if self._last_stop_ts != ts:
+            return
+        last_run = _MM.get("last_llm_run_ts")
+        now = time.monotonic()
+        if last_run is not None and (now - last_run) < self._min_interval_s:
+            return
+        _MM["last_llm_run_ts"] = now
+        logger.info("Multimodal: user stop → LLMRunFrame")
+        await self._queue_frames([LLMRunFrame()])
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if type(frame).__name__ == "UserStoppedSpeakingFrame":
+            now = time.monotonic()
+            self._last_stop_ts = now
             if self._pending is not None:
                 self._pending.cancel()
             self._pending = asyncio.create_task(self._schedule(now))
@@ -333,6 +390,9 @@ async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
 async def run_bot(websocket_client, lead_data, call_control_id=None):
     logger.info(f"Starting bot for lead: {lead_data['id']}")
     logger.info(f"Bot build: {BOT_BUILD_ID}")
+    _MM["last_user_transcription_ts"] = None
+    _MM["last_bot_started_ts"] = None
+    _MM["last_llm_run_ts"] = None
     use_multimodal_live = os.getenv("USE_MULTIMODAL_LIVE", "false").lower() == "true"
     pipeline_sample_rate = 16000
     try:
@@ -461,41 +521,37 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     system_prompt = f"""
 # ROLE
-You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Delivery\" in Amman, Jordan. This is a live phone conversation. Your goal is to be helpful, crisp, and sound 100% like a polite Jordanian man.
+You are Khalid, a real-life delivery coordinator for \"Kawkab Delivery\" in Amman. This is a paid phone call. Be fast, clear, and professional.
 
-# VOCAL PERSONALITY & TONE (CRITICAL FOR LIVE API)
-- Voice Tone: Warm, energetic, and professional.
-- Pacing: Speak at a natural human speed. Do not rush, but do not drone.
-- Vocalisms: Use natural Jordanian fillers like \"تمام\", \"يا هلا\", \"طيب\" to show you are listening.
-- Emotion: If the customer is happy, be warm. If they are in a hurry, be faster and more efficient.
+# DIALECT (JORDANIAN - AMMANI)
+- Speak educated Ammani Jordanian Arabic. No fuṣḥa.
+- Forbidden words (examples): \"ماذا\", \"هل ترغب\", \"سوف\", \"السائق\".
+- Preferred words: \"بدي\", \"المندوب\", \"عشان\", \"هسا\", \"تمام\".
+- Do not mix English/French/Turkish words unless the customer uses them first.
 
-# LANGUAGE & DIALECT (WHITE JORDANIAN)
-- Primary Dialect: Educated Ammani (White Arabic).
-- Phonetics: Use the soft 'G' for 'Qaf' in casual words, but keep the clear 'Q' for professional words like \"تأكيد\".
-- Forbidden Words: NEVER use Fusha words like \"ماذا\", \"هل ترغب\", \"سوف\", or \"السائق\".
-- Preferred Words: Use \"بدي\", \"المندوب\", \"عشان\", \"هسا\".
-- Local Courtesy: Use \"غلبناك معنا\" and \"على راسي\" to build trust.
+# PROFESSIONAL RULES
+- Keep 90% of replies under 10 words.
+- Be respectful, not overly casual.
+- If interrupted, stop immediately and listen.
+- If silence: \"معي يا غالي؟\" once, then wait.
 
-# LIVE CONVERSATION LOGIC
-- Turn-Taking: If the user interrupts you, STOP talking immediately and listen.
-- Silence Handling: If the user is silent for too long, ask politely: \"معي يا غالي؟\".
-- Brevity: Phone calls are expensive and users are busy. Keep 90% of your responses under 10 words.
+# GREETING (MUST)
+- Your very first spoken line must be EXACTLY this, once, then wait:
+\"{greeting_text}\"
+- Do not say \"معك\" twice; use \"معي\" when checking if they are there.
+- Do not repeat the customer name more than once.
 
-# GREETING RULE (IMPORTANT)
-- Your very first spoken line must be EXACTLY this greeting, then wait for the customer:
-  "{greeting_text}"
-
-# GREETING STYLE
-- Do not repeat the customer name more than once in the greeting.
-- Do not say \"معك\" twice in the same sentence; use \"معي\" when checking if they are there.
-
-# RESCHEDULE
-- If the customer asks to move it to tomorrow (\"لبكرا\"), respond briefly:\n  \"تمام، لبكرا ماشي. أي ساعة بناسبك؟\" then wait.
-
-# TASK WORKFLOW
-1. Confirm: \"{customer_name}، طلبك {lead_data['order_items']} رح يوصل ع الساعة {lead_data['delivery_time']}. بنعتمد؟\"
-2. Success: If confirmed, call update_lead_status_confirmed immediately, then say: \"مية مية، هسا برتب مع المندوب ويوصلك ع الموعد. غلبناك!\"
-3. Cancellation: If they cancel, call update_lead_status_cancelled immediately, then say: \"ولا يهمك، حصل خير. لغينا الطلب وبنتمنى نخدمك مرة تانية.\"
+# WORKFLOW (STRICT)
+1) Confirm:
+\"{customer_name}، طلبك {lead_data['order_items']} رح يوصل ع الساعة {lead_data['delivery_time']}. بنعتمد؟\"
+2) If confirmed:
+Call update_lead_status_confirmed immediately, then say:
+\"مية مية، هسا برتب مع المندوب ويوصلك ع الموعد. غلبناك!\"
+3) If cancelled:
+Call update_lead_status_cancelled immediately, then say:
+\"ولا يهمك، حصل خير. لغينا الطلب.\"
+4) If they want tomorrow (\"لبكرا\"):
+\"تمام، لبكرا. أي ساعة بناسبك؟\" then wait.
 
 # CONTEXT
 - Customer: {lead_data['customer_name']}
@@ -691,6 +747,13 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             call_end_delay_s=call_end_delay_s,
             finalized_ref=lead_finalized,
         )
+        enable_run_on_user_stop = (os.getenv("MULTIMODAL_RUN_ON_USER_STOP") or "true").lower() == "true"
+        user_stop_trigger = None
+        if enable_run_on_user_stop:
+            user_stop_trigger = MultimodalUserStopRunTrigger(
+                delay_s=float(os.getenv("MULTIMODAL_RUN_ON_USER_STOP_DELAY_S") or 0.05),
+                min_interval_s=float(os.getenv("MULTIMODAL_RUN_MIN_INTERVAL_S") or 0.25),
+            )
         inbound_audio_logger = InboundAudioLogger()
         turn_state_logger = TurnStateLogger()
         outbound_audio_logger = OutboundAudioLogger()
@@ -701,6 +764,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
                 transport.input(),
                 inbound_audio_logger,
                 mm_aggregators.user(),
+                *([user_stop_trigger] if user_stop_trigger is not None else []),
                 gemini_live,
                 transcript_trigger,
                 transcript_fallback,
@@ -714,6 +778,8 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         )
         task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
         transcript_trigger.set_queue_frames(task.queue_frames)
+        if user_stop_trigger is not None:
+            user_stop_trigger.set_queue_frames(task.queue_frames)
         runner = PipelineRunner()
         did_trigger_initial_run = {"value": False}
         live_connection_failed = {"value": False}
@@ -734,6 +800,9 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         @transport.event_handler("on_client_disconnected")
         async def _on_client_disconnected(_transport, _client):
             call_alive["value"] = False
+            transcript_trigger.cancel_pending()
+            if user_stop_trigger is not None:
+                user_stop_trigger.cancel_pending()
 
         async def multimodal_first_turn_failsafe():
             timeout_s = 8.0
