@@ -8,8 +8,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.frames.frames import LLMRunFrame
-from pipecat.frames.frames import LLMMessagesAppendFrame
+from pipecat.frames.frames import LLMRunFrame, LLMMessagesAppendFrame
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
@@ -20,17 +19,15 @@ from pipecat.frames.frames import AudioRawFrame, InputAudioRawFrame, Transcripti
 from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy
 
-# --- MOCK SERVICE FOR STANDALONE TESTING ---
-# If you have your own file, uncomment your import and remove this function
-# from services.supabase_service import update_lead_status
-def update_lead_status(lead_id, status):
-    logger.info(f"--- DATABASE UPDATE: LEAD {lead_id} STATUS -> {status} ---")
-
 import json
 import time
 
+# --- MOCK SERVICE FOR STANDALONE TESTING ---
+def update_lead_status(lead_id, status):
+    logger.info(f"--- DATABASE UPDATE: LEAD {lead_id} STATUS -> {status} ---")
+
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
-BOT_BUILD_ID = "2026-01-20-dental-coordinator-v1"
+BOT_BUILD_ID = "2026-01-20-dental-coordinator-v2-fixed"
 _VAD_MODEL = {"value": None}
 
 
@@ -283,10 +280,8 @@ class AppointmentStatusTranscriptFallback(FrameProcessor):
         t = AppointmentStatusTranscriptFallback._normalize(text)
         if not t:
             return False
-        # Avoid false positives if they are cancelling
         if any(x in t for x in ["الغ", "كنسل", "cancel", "مش جاي", "ما بقدر", "صعبة", "لا"]):
             return False
-        # Check for strong confirmation words in Ammani
         return any(
             x in t
             for x in [
@@ -322,23 +317,17 @@ class AppointmentStatusTranscriptFallback(FrameProcessor):
                     text = str(getattr(frame, "text", "") or "")
                 except Exception:
                     text = ""
-                # Simple keyword matching as fallback to LLM function calling
                 if self._is_confirm(text):
                     logger.info("Fallback: detected confirmation from transcript")
-                    # We don't hard update status here, we let the LLM do it via function call usually,
-                    # but if you want transcript enforcement, uncomment below:
-                    # self._finalized_ref["value"] = "CONFIRMED"
-                    # update_lead_status(self._lead_id, "CONFIRMED")
                 elif self._is_cancel(text):
                     logger.info("Fallback: detected cancellation from transcript")
-                    # self._finalized_ref["value"] = "CANCELLED"
-                    # update_lead_status(self._lead_id, "CANCELLED")
         await self.push_frame(frame, direction)
 
 
 def normalize_gemini_live_model_name(model: str) -> str:
     model = (model or "").strip()
     if not model:
+        # Defaulting to a stable live model
         return "models/gemini-2.0-flash-live-001"
     if model.startswith("models/"):
         return model
@@ -351,7 +340,6 @@ def normalize_customer_name_for_ar(name: str) -> str:
     raw = (name or "").strip()
     if not raw:
         return raw
-    # Simple transliteration map if needed, or just return raw
     return raw
 
 
@@ -381,8 +369,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     _MM["last_bot_started_ts"] = None
     _MM["last_llm_run_ts"] = None
     
-    # Force multimodal for this professional demo
-    use_multimodal_live = True 
     pipeline_sample_rate = 16000
     try:
         pipeline_sample_rate = int(os.getenv("PIPELINE_SAMPLE_RATE") or os.getenv("GEMINI_LIVE_SAMPLE_RATE") or 16000)
@@ -390,7 +376,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         pipeline_sample_rate = 16000
 
     # ------------------------------------------------------------------
-    # 0. Handle Telnyx Handshake to get stream_id
+    # 0. Handle Telnyx Handshake
     # ------------------------------------------------------------------
     stream_id = "telnyx_stream_placeholder"
     inbound_encoding = "PCMU"
@@ -433,17 +419,12 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         logger.error(f"Failed to capture stream_id from initial message: {e}")
 
     # ------------------------------------------------------------------
-    # 1. Dental Coordinator Configuration
+    # 1. Dental Coordinator Config
     # ------------------------------------------------------------------
     customer_name = normalize_customer_name_for_ar(lead_data.get("customer_name") or "عزيزي")
-    # Default inputs if missing
     appointment_type = lead_data.get("appointment_type", "تنظيف وتبييض أسنان")
     appointment_time = lead_data.get("appointment_time", "بكرا الساعة 4 العصر")
 
-    # Initial Greeting (Spoken first)
-    greeting_text = f"مرحبا {customer_name}، معك سارة من عيادة إليت للأسنان. سامعني واضح؟"
-
-    # VAD Settings
     vad_stop_secs = 0.4
     vad_min_volume = 0.6
     vad = None
@@ -480,7 +461,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     )
 
     # ------------------------------------------------------------------
-    # 2. The Professional System Prompt
+    # 2. System Prompt
     # ------------------------------------------------------------------
     system_prompt = f"""
 # ROLE
@@ -501,28 +482,25 @@ You are calling to confirm an upcoming appointment. This is a high-end, professi
 - Parking: Valet is available.
 
 # WORKFLOW
-1. **Greeting:** (Already spoken: "Hello {customer_name}, Sara from Elite Dental. Can you hear me?")
+1. **Greeting:**
+   - Your FIRST and IMMEDIATE response must be: "مرحبا {customer_name}، معك سارة من عيادة إليت للأسنان. سامعني واضح؟"
    - Wait for them to say "Yes" or "Ah".
 2. **Confirmation:**
    - "حبيت أأكد موعدك {appointment_time} عشان {appointment_type}. بانتظارك دكتور أسامة."
-   - (Translation: Wanted to confirm your appointment [time] for [type]. Dr. Osama is expecting you.)
 3. **If Confirmed:**
    - Call function `confirm_appointment`.
    - Say: "ممتاز! يا ريت لو تيجوا قبل 10 دقايق عشان الإجراءات. بتشرفونا."
    - End politeley.
 4. **If they want to Cancel/Reschedule:**
-   - Show empathy. "سلامتك، ما في مشكلة."
+   - Show empathy.
    - Call function `cancel_appointment` (or ask when they want to move it).
    - Say: "ولا يهمك، بخلي قسم المواعيد يتواصل معك لترتيب وقت تاني. شكراً إلك."
 5. **Handling Questions:**
    - **Price:** "الكشفية 20 دينار، والعلاج حسب الحالة الدكتور بحددلك."
-   - **Pain:** "ما تخاف، الدكتور أسامة إيده خفيفة وبنستخدم تخدير موضعي ممتاز."
    - **Location:** "احنا بعبدون، قرب السفارة. وفي فاليت لسيارتك."
 
-# RULES
-- Keep responses short (1-2 sentences).
-- Be extremely polite.
-- Do NOT repeat the greeting if the conversation is flowing.
+# CRITICAL
+- Do NOT be silent at the start. Speak the greeting immediately.
 """
 
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
@@ -531,33 +509,31 @@ You are calling to confirm an upcoming appointment. This is a high-end, professi
         return
 
     # ------------------------------------------------------------------
-    # 3. Gemini Live Setup
+    # 3. Gemini Live Setup (FIXED)
     # ------------------------------------------------------------------
     from pipecat.services.google.gemini_live.llm import (
         GeminiLiveLLMService as GeminiLiveService,
         InputParams as GeminiLiveInputParams,
     )
     
-    # Optional: Use a specific model if needed
     model_env = os.getenv("GEMINI_LIVE_MODEL")
-    model = normalize_gemini_live_model_name(model_env) if model_env else "models/gemini-2.0-flash-live-001"
-    
-    # 'Aoede' is often a good professional female voice, or 'Charon' for deep male.
+    model = normalize_gemini_live_model_name(model_env)
     voice_id = os.getenv("GEMINI_LIVE_VOICE") or "Aoede" 
 
     gemini_params = GeminiLiveInputParams(temperature=0.3)
-    # Force Arabic support setting if available in your SDK version, otherwise defaults work well
-    try:
-        gemini_params.language = Language.AR
-    except:
-        pass
+    
+    # --- FIX START ---
+    # DO NOT set gemini_params.language = Language.AR here.
+    # Leaving it empty allows Gemini Live to negotiate the connection correctly.
+    # The System Prompt is sufficient to make it speak Arabic.
+    # --- FIX END ---
 
     gemini_kwargs = {
         "api_key": api_key,
         "voice_id": voice_id,
         "system_instruction": system_prompt,
         "params": gemini_params,
-        "inference_on_context_initialization": True,
+        "inference_on_context_initialization": True, # This tells it to generate audio immediately upon connection
         "model": model
     }
     
@@ -567,15 +543,13 @@ You are calling to confirm an upcoming appointment. This is a high-end, professi
     lead_finalized = {"value": None}
 
     # ------------------------------------------------------------------
-    # 4. Function Definitions (Tools)
+    # 4. Functions
     # ------------------------------------------------------------------
     async def confirm_appointment(params: FunctionCallParams):
         logger.info(f"TOOL: Confirming appointment for {lead_data['id']}")
         lead_finalized["value"] = "CONFIRMED"
         update_lead_status(lead_data["id"], "CONFIRMED")
-        # We tell the LLM it succeeded so it can say "Great, see you then"
-        await params.result_callback({"status": "success", "msg": "Appointment confirmed in system."})
-        # Optional: Schedule hangup
+        await params.result_callback({"status": "success", "msg": "Appointment confirmed."})
         if call_control_id:
              asyncio.create_task(hangup_telnyx_call(call_control_id, 4.0))
 
@@ -592,18 +566,14 @@ You are calling to confirm an upcoming appointment. This is a high-end, professi
     gemini_live.register_function("cancel_appointment", cancel_appointment)
 
     # ------------------------------------------------------------------
-    # 5. Pipeline Assembly
+    # 5. Pipeline
     # ------------------------------------------------------------------
     mm_perf = MultimodalPerf()
-    # Start with a hidden message to prime the bot to speak the greeting OR just wait for the user
-    # Ideally, we want the bot to say the greeting first. 
-    # Gemini Live often speaks first if we send a "User joined" or empty message, 
-    # but here we rely on the system prompt instruction "Your first spoken line must be..."
-    mm_context = LLMContext(messages=[{"role": "user", "content": "The call has connected. Say the greeting now."}])
+    # Initial message to force the LLM to start logic
+    mm_context = LLMContext(messages=[{"role": "user", "content": "Call connected. Say the greeting to Oday."}])
 
-    # Turn Strategies
     start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
-    stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=0.6)] # Snappy turns
+    stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=0.6)]
     
     mm_aggregators = LLMContextAggregatorPair(
         mm_context,
@@ -612,13 +582,11 @@ You are calling to confirm an upcoming appointment. This is a high-end, professi
         ),
     )
 
-    # Init Context
     try:
         await gemini_live.set_context(mm_context)
     except Exception:
         pass
 
-    # Processors
     transcript_trigger = MultimodalTranscriptRunTrigger(delay_s=0.7)
     transcript_fallback = AppointmentStatusTranscriptFallback(
         lead_id=lead_data["id"],
@@ -639,7 +607,7 @@ You are calling to confirm an upcoming appointment. This is a high-end, professi
             transcript_fallback,
             TurnStateLogger(),
             OutboundAudioLogger(),
-            AudioFrameChunker(chunk_ms=20), # Smooth playback
+            AudioFrameChunker(chunk_ms=20),
             mm_perf,
             transport.output(),
             mm_aggregators.assistant(),
@@ -652,9 +620,6 @@ You are calling to confirm an upcoming appointment. This is a high-end, professi
     
     runner = PipelineRunner()
     
-    # ------------------------------------------------------------------
-    # 6. Safety & Re-prompts
-    # ------------------------------------------------------------------
     call_alive = {"value": True}
 
     @transport.event_handler("on_client_disconnected")
@@ -663,11 +628,12 @@ You are calling to confirm an upcoming appointment. This is a high-end, professi
         transcript_trigger.cancel_pending()
         user_stop_trigger.cancel_pending()
 
-    # If the bot is silent for too long at the start, nudge it
+    # Safety kicker: If bot doesn't speak in 2 seconds, force it.
     async def kickstart_conversation():
         await asyncio.sleep(2.0)
         if not _MM.get("last_bot_started_ts") and call_alive["value"]:
             logger.info("Bot silent at start, triggering LLM...")
+            # Pushing a run frame forces the LLM to look at the context and generate
             await task.queue_frames([LLMRunFrame()])
 
     asyncio.create_task(kickstart_conversation())
