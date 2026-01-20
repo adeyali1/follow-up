@@ -454,8 +454,9 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             vad_analyzer=vad,
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_in_sample_rate=pipeline_sample_rate,
-            audio_out_sample_rate=pipeline_sample_rate,
+          audio_in_sample_rate=stream_sample_rate,     # ✅ Telnyx real rate (8000)
+          audio_out_sample_rate=pipeline_sample_rate,  # ✅ Gemini rate (16000)
+
         ),
     )
 
@@ -825,4 +826,5 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         return
     logger.error("Classic STT/Vertex/TTS pipeline has been removed. Set USE_MULTIMODAL_LIVE=true.")
     return
+
 
