@@ -2,6 +2,7 @@ import os
 import asyncio
 import aiohttp
 from urllib.parse import quote
+import audioop
 from loguru import logger
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -214,6 +215,38 @@ class AudioSampleRateResampler(FrameProcessor):
         elif isinstance(frame, OutputAudioRawFrame) and frame.sample_rate != self._target_out:
             resampled = await self._out_resampler.resample(frame.audio, frame.sample_rate, self._target_out)
             frame = OutputAudioRawFrame(audio=resampled, sample_rate=self._target_out, num_channels=frame.num_channels)
+        await self.push_frame(frame, direction)
+
+
+class TelnyxPcmDecoder(FrameProcessor):
+    def __init__(self, *, inbound_encoding: str):
+        super().__init__()
+        self._encoding = (inbound_encoding or "").strip().upper()
+        self._logged = 0
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            audio = frame.audio
+            if isinstance(audio, (bytes, bytearray)):
+                if self._logged < 10:
+                    logger.debug(f"AudioIn: sr={frame.sample_rate} bytes={len(audio)} enc={self._encoding}")
+                    self._logged += 1
+                if self._encoding in {"PCMA", "PCMU"}:
+                    expected_8bit = int(frame.sample_rate / 50) * max(int(getattr(frame, "num_channels", 1) or 1), 1)
+                    if len(audio) in {expected_8bit, expected_8bit * 2} and len(audio) == expected_8bit:
+                        try:
+                            if self._encoding == "PCMA":
+                                decoded = audioop.alaw2lin(audio, 2)
+                            else:
+                                decoded = audioop.ulaw2lin(audio, 2)
+                            frame = InputAudioRawFrame(
+                                audio=decoded,
+                                sample_rate=frame.sample_rate,
+                                num_channels=frame.num_channels,
+                            )
+                        except Exception:
+                            pass
         await self.push_frame(frame, direction)
 
 
@@ -430,10 +463,6 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         except Exception:
             pass
         try:
-            gemini_params.mime_type = "audio/pcm"
-        except Exception:
-            pass
-        try:
             if GeminiModalities is not None:
                 gemini_params.modalities = GeminiModalities.AUDIO
         except Exception:
@@ -573,11 +602,13 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             call_end_delay_s=call_end_delay_s,
             finalized_ref=lead_finalized,
         )
+        telnyx_decoder = TelnyxPcmDecoder(inbound_encoding=inbound_encoding)
 
         pipeline = Pipeline(
             [
                 transport.input(),
                 mm_aggregators.user(),
+                telnyx_decoder,
                 input_resampler,
                 gemini_live,
                 transcript_trigger,
@@ -593,14 +624,21 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         runner = PipelineRunner()
         did_trigger_initial_run = {"value": False}
         live_connection_failed = {"value": False}
+        call_alive = {"value": True}
 
         @transport.event_handler("on_client_connected")
         async def _on_client_connected(_transport, _client):
+            if not call_alive["value"]:
+                return
             if did_trigger_initial_run["value"]:
                 return
             did_trigger_initial_run["value"] = True
             logger.info("Multimodal: client connected, triggering initial LLMRunFrame")
             await task.queue_frames([LLMRunFrame()])
+
+        @transport.event_handler("on_client_disconnected")
+        async def _on_client_disconnected(_transport, _client):
+            call_alive["value"] = False
 
         async def multimodal_first_turn_failsafe():
             timeout_s = 8.0
@@ -609,6 +647,8 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             except Exception:
                 timeout_s = 8.0
             await asyncio.sleep(timeout_s)
+            if not call_alive["value"]:
+                return
             if _MM.get("last_bot_started_ts") is None and not live_connection_failed["value"]:
                 logger.warning("Multimodal: first bot audio not detected yet; re-triggering LLMRunFrame")
                 await task.queue_frames([LLMRunFrame()])
@@ -621,6 +661,8 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
                 timeout_s = 10.0
             while True:
                 await asyncio.sleep(0.5)
+                if not call_alive["value"]:
+                    return
                 user_ts = _MM.get("last_user_transcription_ts")
                 bot_ts = _MM.get("last_bot_started_ts")
                 if user_ts is None:
@@ -649,6 +691,8 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
                 max_retries = 3
             for attempt in range(max_retries):
                 await asyncio.sleep(timeout_s)
+                if not call_alive["value"]:
+                    return
                 if live_connection_failed["value"]:
                     logger.error("Multimodal: live connection failed (model/key). Stop retrying.")
                     return
@@ -668,6 +712,12 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             asyncio.create_task(multimodal_first_turn_failsafe())
         if (os.getenv("MULTIMODAL_ENABLE_STUCK_WATCHDOG") or "true").lower() == "true":
             asyncio.create_task(multimodal_stuck_watchdog())
+        logger.info(
+            "Multimodal extra tasks enabled: "
+            f"start_retry={(os.getenv('MULTIMODAL_ENABLE_START_RETRY') or 'false').lower() == 'true'}, "
+            f"first_turn_failsafe={(os.getenv('MULTIMODAL_ENABLE_FIRST_TURN_FAILSAFE') or 'false').lower() == 'true'}, "
+            f"stuck_watchdog={(os.getenv('MULTIMODAL_ENABLE_STUCK_WATCHDOG') or 'true').lower() == 'true'}"
+        )
         await runner.run(task)
         return
     logger.error("Classic STT/Vertex/TTS pipeline has been removed. Set USE_MULTIMODAL_LIVE=true.")
