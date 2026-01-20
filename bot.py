@@ -522,7 +522,7 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         mm_perf = MultimodalPerf()
         logger.info(f"Multimodal pipeline sample_rate={pipeline_sample_rate}, telnyx_sr={stream_sample_rate}, encoding={inbound_encoding}")
 
-        mm_context = LLMContext(messages=[])
+        mm_context = LLMContext(messages=[{"role": "user", "content": " "}])
         user_mute_strategies = []
         mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
         if mute_first_bot:
@@ -623,7 +623,12 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
             if did_trigger_initial_run["value"]:
                 return
             did_trigger_initial_run["value"] = True
-            logger.info("Multimodal: client connected, triggering initial LLMRunFrame")
+            try:
+                logger.info(
+                    f"Multimodal: client connected, triggering initial LLMRunFrame (context_messages={len(mm_context.messages)})"
+                )
+            except Exception:
+                logger.info("Multimodal: client connected, triggering initial LLMRunFrame")
             await task.queue_frames([LLMRunFrame()])
 
         @transport.event_handler("on_client_disconnected")
