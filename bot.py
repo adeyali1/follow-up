@@ -527,8 +527,8 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
         gemini_live.register_function("update_lead_status_cancelled", cancel_order)
 
         input_resampler = AudioSampleRateResampler(
-            target_input_sample_rate=stream_sample_rate,
-            target_output_sample_rate=gemini_in_sample_rate,
+            target_input_sample_rate=gemini_in_sample_rate,
+            target_output_sample_rate=stream_sample_rate,
         )
         output_resampler = AudioSampleRateResampler(
             target_input_sample_rate=gemini_in_sample_rate,
@@ -706,18 +706,27 @@ You are Khalid, a real-life, professional delivery coordinator for \"Kawkab Deli
                     ]
                 )
 
-        if (os.getenv("MULTIMODAL_ENABLE_START_RETRY") or "false").lower() == "true":
+        enable_start_retry = (os.getenv("MULTIMODAL_ENABLE_START_RETRY") or "false").lower() == "true"
+        enable_first_turn_failsafe = (os.getenv("MULTIMODAL_ENABLE_FIRST_TURN_FAILSAFE") or "false").lower() == "true"
+        enable_stuck_watchdog = (os.getenv("MULTIMODAL_ENABLE_STUCK_WATCHDOG") or "true").lower() == "true"
+        if enable_start_retry:
             asyncio.create_task(multimodal_silent_start_retry())
-        if (os.getenv("MULTIMODAL_ENABLE_FIRST_TURN_FAILSAFE") or "false").lower() == "true":
+        if enable_first_turn_failsafe:
             asyncio.create_task(multimodal_first_turn_failsafe())
-        if (os.getenv("MULTIMODAL_ENABLE_STUCK_WATCHDOG") or "true").lower() == "true":
+        if enable_stuck_watchdog:
             asyncio.create_task(multimodal_stuck_watchdog())
         logger.info(
             "Multimodal extra tasks enabled: "
-            f"start_retry={(os.getenv('MULTIMODAL_ENABLE_START_RETRY') or 'false').lower() == 'true'}, "
-            f"first_turn_failsafe={(os.getenv('MULTIMODAL_ENABLE_FIRST_TURN_FAILSAFE') or 'false').lower() == 'true'}, "
-            f"stuck_watchdog={(os.getenv('MULTIMODAL_ENABLE_STUCK_WATCHDOG') or 'true').lower() == 'true'}"
+            f"start_retry={enable_start_retry}, "
+            f"first_turn_failsafe={enable_first_turn_failsafe}, "
+            f"stuck_watchdog={enable_stuck_watchdog}"
         )
+        if enable_start_retry or enable_first_turn_failsafe:
+            logger.warning(
+                "Multimodal: start_retry/first_turn_failsafe are enabled; "
+                "these can increase latency or fight initial scheduling. "
+                "Set MULTIMODAL_ENABLE_START_RETRY=false and MULTIMODAL_ENABLE_FIRST_TURN_FAILSAFE=false."
+            )
         await runner.run(task)
         return
     logger.error("Classic STT/Vertex/TTS pipeline has been removed. Set USE_MULTIMODAL_LIVE=true.")
