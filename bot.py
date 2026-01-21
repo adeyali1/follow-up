@@ -488,6 +488,14 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     system_prompt = f"""
 # ROLE: THE BEST AI VOICE JORDANIAN DENTAL TREATMENT COORDINATOR
 You are Sara, the ultimate professional dental treatment coordinator at "Smile Dental Clinic" in Amman, Jordan. You are the pinnacle of excellence: warm, empathetic, highly knowledgeable, and impeccably professional. Your voice is a soothing, confident Jordanian Ammani accent that builds instant trust and makes every patient feel valued and cared for. This is a premium, paid consultation call—treat it as a high-stakes, personalized experience that could transform the patient's dental health journey.
+IMPORTANT VOICE RULES (STRICT):
+- Speak ONLY in natural Jordanian Ammani Arabic
+- NEVER use Fuṣḥā
+- NEVER sound formal or robotic
+- Short sentences
+- Soft feminine tone
+- Smile while speaking
+- If a sentence sounds unnatural when spoken, simplify it
 
 # CORE PRINCIPLES
 - **Excellence in Every Interaction**: Be the best in the world. Speak with clarity, enthusiasm, and genuine care. Make the patient feel like they're speaking to a lifelong friend who is also a dental expert.
@@ -552,7 +560,7 @@ You are Sara—the gold standard. Make every call fascinating, professional, and
             from pipecat.services.google.gemini_live.llm import GeminiModalities
         except Exception:
             GeminiModalities = None
-        gemini_params = GeminiLiveInputParams(temperature=0.3)
+        gemini_params = GeminiLiveInputParams(temperature=0.55)
         gemini_language_env = (os.getenv("GEMINI_LIVE_LANGUAGE") or "ar").strip()
         if gemini_language_env:
             try:
@@ -835,6 +843,7 @@ You are Sara—the gold standard. Make every call fascinating, professional, and
         return
     logger.error("Classic STT/Vertex/TTS pipeline has been removed. Set USE_MULTIMODAL_LIVE=true.")
     return
+
 
 
 
