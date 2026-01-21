@@ -319,13 +319,28 @@ def build_multimodal_opening_message(greeting_text: str) -> str:
     greeting_text = (greeting_text or "").strip()
     return greeting_text
 def normalize_customer_name_for_ar(name: str) -> str:
-    raw = (name or "").strip()
-    if not raw:
-        return raw
-    lowered = raw.lower()
-    if lowered == "oday":
-        return "عدي"
-    return raw
+    if not name:
+        return "عزيزي"
+
+    name = name.strip().lower()
+
+    mapping = {
+        "oday": "عُدَي",
+        "odai": "عُدَي",
+        "mohammad": "محمد",
+        "mohamed": "محمد",
+        "ahmad": "أحمد",
+        "ahmed": "أحمد",
+        "omar": "عمر",
+        "ali": "علي",
+        "yousef": "يوسف",
+        "yousef": "يوسف",
+        "hijazi": "حجازي",
+
+    }
+
+    return mapping.get(name, name)
+
 async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
     if not call_control_id:
         return
@@ -820,6 +835,7 @@ You are Sara—the gold standard. Make every call fascinating, professional, and
         return
     logger.error("Classic STT/Vertex/TTS pipeline has been removed. Set USE_MULTIMODAL_LIVE=true.")
     return
+
 
 
 
