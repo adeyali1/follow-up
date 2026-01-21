@@ -71,7 +71,7 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 # --- 2. OPTIMIZED VOIP CHUNKER (20ms) ---
-# This is critical for Telnyx. Do not change 20ms.
+# Critical for Telnyx audio quality.
 class AudioFrameChunker(FrameProcessor):
     def __init__(self, *, chunk_ms: int = 20):
         super().__init__()
@@ -86,7 +86,7 @@ class AudioFrameChunker(FrameProcessor):
             bytes_per_sample = 2
             bytes_per_frame = channels * bytes_per_sample
             
-            # Calculate exactly how many bytes equal 20ms
+            # Exact bytes for chunk duration
             target_bytes = int(sample_rate * self._chunk_ms / 1000) * bytes_per_frame
             target_bytes = max(target_bytes - (target_bytes % bytes_per_frame), bytes_per_frame)
             
@@ -99,7 +99,6 @@ class AudioFrameChunker(FrameProcessor):
                     if not chunk: continue
                     await self.push_frame(frame_type(audio=chunk, sample_rate=sample_rate, num_channels=channels), direction)
                     if self._pace and not first:
-                        # Exact sleep to mimic real-time streaming
                         await asyncio.sleep(self._chunk_ms / 1000.0)
                     first = False
                 return
@@ -128,7 +127,10 @@ class AppointmentStatusTranscriptFallback(FrameProcessor):
         await self.push_frame(frame, direction)
 
 def normalize_gemini_live_model_name(model: str) -> str:
-    if not model or not model.strip(): return "models/gemini-2.0-flash-exp"
+    # SAFETY FORCE: If the model name looks wrong or empty, force the working one.
+    if not model or "live-001" in model or not model.strip(): 
+        logger.warning(f"Model '{model}' is likely invalid/deprecated. Forcing 'models/gemini-2.0-flash-exp'")
+        return "models/gemini-2.0-flash-exp"
     if "models/" not in model: return f"models/{model}"
     return model
 
@@ -143,14 +145,13 @@ async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
     except: pass
 
 async def run_bot(websocket_client, lead_data, call_control_id=None):
-    logger.info(f"Starting OPTIMIZED bot for lead: {lead_data['id']}")
+    logger.info(f"Starting FINAL STABLE bot for lead: {lead_data['id']}")
     
-    # AI works best at 16k. We will downsample for Telnyx later.
     pipeline_sample_rate = 16000 
     
-    # 0. Telnyx Handshake & Codec Detection
+    # 0. Telnyx Handshake
     stream_id = "telnyx_stream_placeholder"
-    inbound_encoding = "PCMU" # Default Fallback
+    inbound_encoding = "PCMU" 
     
     try:
         for _ in range(3):
@@ -158,13 +159,13 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             logger.debug(f"Telnyx Handshake: {msg_text}")
             msg = json.loads(msg_text)
             
-            # Smart Codec Detection
+            # Detect Codec
             media_format = msg.get("media_format") or msg.get("start", {}).get("media_format")
             if media_format:
                 enc = media_format.get("encoding", "").upper()
                 if enc == "PCMA": 
                     inbound_encoding = "PCMA"
-                    logger.info("Codec detected: PCMA (Optimized for Jordan/EU)")
+                    logger.info("Codec detected: PCMA")
                 elif enc == "PCMU":
                     inbound_encoding = "PCMU"
 
@@ -182,18 +183,16 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     appointment_type = lead_data.get("appointment_type", "تنظيف وتبييض أسنان")
     appointment_time = lead_data.get("appointment_time", "بكرا الساعة 4 العصر")
 
-    # --- 3. PROFESSIONAL VAD TUNING ---
-    # Optimized to ignore background noise but catch human speech quickly
+    # --- 3. VAD TUNING ---
     vad = SileroVADAnalyzer(
         params=VADParams(
-            min_volume=0.8,    # High threshold ignores breath/noise
-            start_secs=0.4,    # Waits 400ms to confirm speech (anti-interruption)
-            stop_secs=0.7,     # Snappy turn taking
+            min_volume=0.8,
+            start_secs=0.4,
+            stop_secs=0.7,
             confidence=0.75
         )
     )
 
-    # Serializer matches Telnyx codec exactly to prevent transcoding lag
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
         call_control_id=call_control_id,
@@ -217,7 +216,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
-    # 4. System Prompt (Token Efficient)
+    # 4. System Prompt
     system_prompt = f"""
 # ROLE
 You are **Sara** from **"Elite Dental Clinic"** in Amman.
@@ -238,22 +237,25 @@ Confirm appointment with {customer_name}.
 3. **If Confirmed:** Tool `confirm_appointment`.
 4. **If Cancel:** Tool `cancel_appointment`.
 
-# CRITICAL RULES
+# RULES
 - START SPEAKING IMMEDIATELY.
 - Keep replies under 5 seconds.
 """
 
-    # 5. Gemini Service (Fast Start)
+    # 5. Gemini Service
     from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, InputParams
     
+    # Correct model name is critical here
+    model_name = normalize_gemini_live_model_name(os.getenv("GEMINI_LIVE_MODEL"))
+    logger.info(f"Using Gemini Model: {model_name}")
+
     gemini_live = GeminiLiveLLMService(
         api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
         voice_id=os.getenv("GEMINI_LIVE_VOICE") or "Aoede",
         system_instruction=system_prompt,
         params=InputParams(temperature=0.3),
-        # TRUE = Generates audio immediately (Zero Latency Start)
         inference_on_context_initialization=True, 
-        model=normalize_gemini_live_model_name(os.getenv("GEMINI_LIVE_MODEL"))
+        model=model_name
     )
 
     lead_finalized = {"value": None}
@@ -274,9 +276,8 @@ Confirm appointment with {customer_name}.
     gemini_live.register_function("confirm_appointment", confirm_appointment)
     gemini_live.register_function("cancel_appointment", cancel_appointment)
 
-    # 7. Pipeline Assembly
+    # 7. Pipeline
     mm_perf = MultimodalPerf()
-    # Empty context relies on inference_on_context_initialization
     mm_context = LLMContext(messages=[]) 
 
     start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
@@ -298,7 +299,6 @@ Confirm appointment with {customer_name}.
         finalized_ref=lead_finalized,
     )
     
-    # 20ms Chunker (The most important line for audio quality)
     audio_chunker = AudioFrameChunker(chunk_ms=20)
 
     pipeline = Pipeline(
@@ -308,7 +308,7 @@ Confirm appointment with {customer_name}.
             gemini_live,
             transcript_trigger,
             transcript_fallback,
-            audio_chunker, # Must be before transport output
+            audio_chunker, 
             mm_perf,
             transport.output(),
             mm_aggregators.assistant(),
