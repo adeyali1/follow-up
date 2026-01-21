@@ -17,7 +17,6 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.frames.frames import AudioRawFrame, TranscriptionFrame
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy
-
 import json
 import time
 
@@ -28,7 +27,7 @@ def update_lead_status(lead_id, status):
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None}
 _VAD_MODEL = {"value": None}
 
-# --- LATENCY MONITOR ---
+# --- 1. LATENCY MONITOR ---
 class MultimodalPerf(FrameProcessor):
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -38,7 +37,8 @@ class MultimodalPerf(FrameProcessor):
             now = time.monotonic()
             _MM["last_bot_started_ts"] = now
             if _MM["last_user_transcription_ts"]:
-                logger.info(f"⚡ Latency: {now - _MM['last_user_transcription_ts']:.3f}s")
+                latency = (now - _MM['last_user_transcription_ts']) * 1000
+                logger.info(f"⚡ Latency: {latency:.0f}ms")
         await self.push_frame(frame, direction)
 
 class MultimodalTranscriptRunTrigger(FrameProcessor):
@@ -70,8 +70,8 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
                 self._pending = asyncio.create_task(self._schedule(now))
         await self.push_frame(frame, direction)
 
-# --- STRICT VOIP CHUNKER (20ms) ---
-# This ensures audio packets are exactly the size Telnyx expects, preventing "choppy" audio.
+# --- 2. OPTIMIZED VOIP CHUNKER (20ms) ---
+# This is critical for Telnyx. Do not change 20ms.
 class AudioFrameChunker(FrameProcessor):
     def __init__(self, *, chunk_ms: int = 20):
         super().__init__()
@@ -85,6 +85,8 @@ class AudioFrameChunker(FrameProcessor):
             channels = frame.num_channels
             bytes_per_sample = 2
             bytes_per_frame = channels * bytes_per_sample
+            
+            # Calculate exactly how many bytes equal 20ms
             target_bytes = int(sample_rate * self._chunk_ms / 1000) * bytes_per_frame
             target_bytes = max(target_bytes - (target_bytes % bytes_per_frame), bytes_per_frame)
             
@@ -97,6 +99,7 @@ class AudioFrameChunker(FrameProcessor):
                     if not chunk: continue
                     await self.push_frame(frame_type(audio=chunk, sample_rate=sample_rate, num_channels=channels), direction)
                     if self._pace and not first:
+                        # Exact sleep to mimic real-time streaming
                         await asyncio.sleep(self._chunk_ms / 1000.0)
                     first = False
                 return
@@ -125,7 +128,6 @@ class AppointmentStatusTranscriptFallback(FrameProcessor):
         await self.push_frame(frame, direction)
 
 def normalize_gemini_live_model_name(model: str) -> str:
-    # Force a fast model if input is questionable
     if not model or not model.strip(): return "models/gemini-2.0-flash-exp"
     if "models/" not in model: return f"models/{model}"
     return model
@@ -141,48 +143,57 @@ async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
     except: pass
 
 async def run_bot(websocket_client, lead_data, call_control_id=None):
-    logger.info(f"Starting FAST-PATH bot for lead: {lead_data['id']}")
+    logger.info(f"Starting OPTIMIZED bot for lead: {lead_data['id']}")
     
+    # AI works best at 16k. We will downsample for Telnyx later.
     pipeline_sample_rate = 16000 
-    stream_sample_rate = 8000
     
-    # 0. Telnyx Handshake
+    # 0. Telnyx Handshake & Codec Detection
     stream_id = "telnyx_stream_placeholder"
-    inbound_encoding = "PCMU"
+    inbound_encoding = "PCMU" # Default Fallback
     
     try:
         for _ in range(3):
             msg_text = await websocket_client.receive_text()
+            logger.debug(f"Telnyx Handshake: {msg_text}")
             msg = json.loads(msg_text)
-            if "media_format" in msg:
-                if msg["media_format"].get("encoding", "").upper() == "PCMA": inbound_encoding = "PCMA"
-            elif "start" in msg:
-                if msg["start"].get("media_format", {}).get("encoding", "").upper() == "PCMA": inbound_encoding = "PCMA"
+            
+            # Smart Codec Detection
+            media_format = msg.get("media_format") or msg.get("start", {}).get("media_format")
+            if media_format:
+                enc = media_format.get("encoding", "").upper()
+                if enc == "PCMA": 
+                    inbound_encoding = "PCMA"
+                    logger.info("Codec detected: PCMA (Optimized for Jordan/EU)")
+                elif enc == "PCMU":
+                    inbound_encoding = "PCMU"
+
             if "stream_id" in msg: 
                 stream_id = msg["stream_id"]
                 break
-            if msg.get("event") == "start":
-                if "stream_id" in msg: stream_id = msg["stream_id"]
+            if msg.get("event") == "start" and "stream_id" in msg:
+                stream_id = msg["stream_id"]
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Handshake error: {e}")
 
     # 1. Config
     customer_name = lead_data.get("customer_name") or "عزيزي"
     appointment_type = lead_data.get("appointment_type", "تنظيف وتبييض أسنان")
     appointment_time = lead_data.get("appointment_time", "بكرا الساعة 4 العصر")
 
-    # --- FAST VAD ---
-    # Optimized for quick turn-taking while ignoring noise.
+    # --- 3. PROFESSIONAL VAD TUNING ---
+    # Optimized to ignore background noise but catch human speech quickly
     vad = SileroVADAnalyzer(
         params=VADParams(
-            min_volume=0.8, 
-            start_secs=0.3, # Faster interruption detection
-            stop_secs=0.7, 
+            min_volume=0.8,    # High threshold ignores breath/noise
+            start_secs=0.4,    # Waits 400ms to confirm speech (anti-interruption)
+            stop_secs=0.7,     # Snappy turn taking
             confidence=0.75
         )
     )
 
+    # Serializer matches Telnyx codec exactly to prevent transcoding lag
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
         call_control_id=call_control_id,
@@ -206,11 +217,10 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
-    # 2. Optimized System Prompt
-    # Removed bulk. Key instruction: "Start speaking immediately."
+    # 4. System Prompt (Token Efficient)
     system_prompt = f"""
 # ROLE
-You are **Sara**, from **"Elite Dental Clinic"** in Amman.
+You are **Sara** from **"Elite Dental Clinic"** in Amman.
 Confirm appointment with {customer_name}.
 
 # TONE (Ammani Arabic)
@@ -229,11 +239,11 @@ Confirm appointment with {customer_name}.
 4. **If Cancel:** Tool `cancel_appointment`.
 
 # CRITICAL RULES
-- START SPEAKING IMMEDIATELY upon connection.
+- START SPEAKING IMMEDIATELY.
 - Keep replies under 5 seconds.
 """
 
-    # 3. Gemini Service (FAST START ENABLED)
+    # 5. Gemini Service (Fast Start)
     from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, InputParams
     
     gemini_live = GeminiLiveLLMService(
@@ -241,14 +251,14 @@ Confirm appointment with {customer_name}.
         voice_id=os.getenv("GEMINI_LIVE_VOICE") or "Aoede",
         system_instruction=system_prompt,
         params=InputParams(temperature=0.3),
-        # ENABLED: This makes the bot speak immediately without waiting for a trigger
+        # TRUE = Generates audio immediately (Zero Latency Start)
         inference_on_context_initialization=True, 
         model=normalize_gemini_live_model_name(os.getenv("GEMINI_LIVE_MODEL"))
     )
 
     lead_finalized = {"value": None}
 
-    # 4. Tools
+    # 6. Tools
     async def confirm_appointment(params: FunctionCallParams):
         lead_finalized["value"] = "CONFIRMED"
         update_lead_status(lead_data["id"], "CONFIRMED")
@@ -264,9 +274,9 @@ Confirm appointment with {customer_name}.
     gemini_live.register_function("confirm_appointment", confirm_appointment)
     gemini_live.register_function("cancel_appointment", cancel_appointment)
 
-    # 5. Pipeline
+    # 7. Pipeline Assembly
     mm_perf = MultimodalPerf()
-    # No hidden "Call connected" message. We rely on inference_on_context_initialization for speed.
+    # Empty context relies on inference_on_context_initialization
     mm_context = LLMContext(messages=[]) 
 
     start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
@@ -288,7 +298,7 @@ Confirm appointment with {customer_name}.
         finalized_ref=lead_finalized,
     )
     
-    # 20ms Chunker for VoIP stability
+    # 20ms Chunker (The most important line for audio quality)
     audio_chunker = AudioFrameChunker(chunk_ms=20)
 
     pipeline = Pipeline(
@@ -298,7 +308,7 @@ Confirm appointment with {customer_name}.
             gemini_live,
             transcript_trigger,
             transcript_fallback,
-            audio_chunker,
+            audio_chunker, # Must be before transport output
             mm_perf,
             transport.output(),
             mm_aggregators.assistant(),
