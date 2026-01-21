@@ -333,7 +333,7 @@ def normalize_gemini_live_model_name(model: str) -> str:
     model = (model or "").strip()
     if not model:
         # 2.0 Flash is faster and better at accents
-        return "models/gemini-2.0-flash-live-001"
+        return "models/gemini-2.5-flash-native-audio-preview-12-2025"
     if model.startswith("models/"):
         return model
     if "/" in model:
@@ -667,3 +667,4 @@ GOAL: Make the patient feel they are talking to a real human in Abdoun or Khalda
     asyncio.create_task(silence_breaker())
 
     await runner.run(task)
+
