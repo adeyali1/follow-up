@@ -1,3 +1,5 @@
+--- START OF FILE Paste January 21, 2026 - 3:02PM ---
+
 import os
 import asyncio
 import aiohttp
@@ -25,7 +27,7 @@ import time
 
 # --- GLOBAL STATE ---
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
-BOT_BUILD_ID = "2026-01-21-multimodal-jordanian-v2"
+BOT_BUILD_ID = "2026-01-21-multimodal-jordanian-FIXED-SR"
 _VAD_MODEL = {"value": None}
 
 # --- PROCESSORS ---
@@ -324,7 +326,6 @@ class LeadStatusTranscriptFallback(FrameProcessor):
 def normalize_gemini_live_model_name(model: str) -> str:
     model = (model or "").strip()
     if not model:
-        # UPDATED: Use the latest Flash 2.0 model which is faster and better at accents
         return "models/gemini-2.0-flash-exp" 
     if model.startswith("models/"):
         return model
@@ -332,7 +333,6 @@ def normalize_gemini_live_model_name(model: str) -> str:
         return model
     return f"models/{model}"
 
-# --- MODIFIED: USE TASHKEEL FOR PRONUNCIATION ---
 def normalize_customer_name_for_ar(name: str) -> str:
     if not name:
         return "عزيزي"
@@ -389,13 +389,14 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     _MM["last_llm_run_ts"] = None
     
     use_multimodal_live = os.getenv("USE_MULTIMODAL_LIVE", "true").lower() == "true"
-    pipeline_sample_rate = 16000
-    try:
-        pipeline_sample_rate = int(os.getenv("PIPELINE_SAMPLE_RATE") or os.getenv("GEMINI_LIVE_SAMPLE_RATE") or 16000)
-    except Exception:
-        pipeline_sample_rate = 16000
-        
-    # Mock lead_data if keys are missing
+    
+    # IMPORTANT: Telnyx needs 8000Hz (PCMA/PCMU). 
+    # Pipeline input from Telnyx = 8000.
+    # Pipeline output to Telnyx = 8000.
+    # Gemini input = 16000 (resampled by Pipecat).
+    pipeline_in_sample_rate = 16000
+    telnyx_out_sample_rate = 8000 # CRITICAL FIX
+    
     if 'patient_name' not in lead_data:
         lead_data['patient_name'] = lead_data.get('customer_name', 'المريض')
     if 'treatment' not in lead_data:
@@ -407,10 +408,10 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.info(f"Using lead_data: {lead_data}") 
 
-    # 0. Handle Telnyx Handshake to get stream_id
     stream_id = "telnyx_stream_placeholder"
     inbound_encoding = "PCMU"
-    stream_sample_rate = 8000
+    
+    # Telnyx handshake
     try:
         logger.info("Waiting for Telnyx 'start' event with stream_id...")
         for _ in range(3): 
@@ -419,26 +420,16 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             msg = json.loads(msg_text)
             if "media_format" in msg:
                 encoding = msg["media_format"].get("encoding", "").upper()
-                stream_sample_rate = int(msg["media_format"].get("sample_rate", stream_sample_rate) or stream_sample_rate)
-                if encoding == "G729":
-                    logger.error("CRITICAL: Telnyx is sending G.729 audio. Pipecat requires PCMU (G.711u) or PCMA (G.711a).")
-                elif encoding == "PCMA":
+                if encoding == "PCMA":
                     inbound_encoding = "PCMA"
                 elif encoding == "PCMU":
                     inbound_encoding = "PCMU"
-                elif encoding == "L16":
-                    inbound_encoding = "L16"
             elif "start" in msg and "media_format" in msg["start"]:
                 encoding = msg["start"]["media_format"].get("encoding", "").upper()
-                stream_sample_rate = int(msg["start"]["media_format"].get("sample_rate", stream_sample_rate) or stream_sample_rate)
-                if encoding == "G729":
-                    logger.error("CRITICAL: Telnyx is sending G.729 audio.")
-                elif encoding == "PCMA":
+                if encoding == "PCMA":
                     inbound_encoding = "PCMA"
                 elif encoding == "PCMU":
                     inbound_encoding = "PCMU"
-                elif encoding == "L16":
-                    inbound_encoding = "L16"
             if "stream_id" in msg:
                 stream_id = msg["stream_id"]
                 break
@@ -452,47 +443,41 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     except Exception as e:
         logger.error(f"Failed to capture stream_id from initial message: {e}")
 
-    # --- PREPARE DATA FOR PROMPT ---
     patient_name = normalize_customer_name_for_ar(lead_data.get("patient_name", "المريض"))
     treatment = lead_data.get("treatment", "تنظيف أسنان")
     appointment_time = lead_data.get("appointment_time", "الساعة 11:00")
     
-    # --- MODIFIED SYSTEM PROMPT (PERSONA BASED, NOT SCRIPT) ---
-    # This instructs the AI to ACT naturally rather than READ.
+    # --- FIXED PROMPT FOR REAL JORDANIAN ACCENT ---
     system_prompt = f"""
     # SYSTEM CONFIGURATION
     Role: Sara, a smart and warm dental coordinator at 'Ibtisama Clinic' in Amman, Jordan.
     Language: Native Jordanian Arabic (Ammani Dialect). 
-    Voice Style: Conversational, Empathetic, Extremely Natural.
     
-    # RULES FOR SPEAKING (CRITICAL)
-    1. **NO ROBOTIC READING**: Do not speak like you are reading a book. Speak like you are talking to a friend on the phone.
-    2. **USE FILLERS**: Use words like "Ya3ni", "Tab3an", "Ah akeed", "Hassa", "Shuu" to sound human.
-    3. **DIALECT MAPPING**:
-       - Say "Hassa" (هسا) NOT "Al'an" (الآن).
-       - Say "Biddi" (بدي) NOT "Ureed" (أريد).
-       - Say "Keef halak" (كيف حالك) NOT "Kayfa haluka".
-       - Say "Ra7" (رح) for future tense.
-    4. **LISTEN MORE**: If the user interrupts, stop immediately.
-    
+    # IMPORTANT VOICE INSTRUCTIONS (HOW TO SPEAK)
+    1. **ACCENT**: You MUST speak in "Ammiya" (Street Arabic), NOT Fusha.
+    2. **TONE**: Warm, friendly, authentic.
+    3. **KEY WORDS (Use these to sound human)**:
+       - Use "Ah" (آه) instead of "Na'am".
+       - Use "Hassa" (هسا) instead of "Al-an".
+       - Use "Biddi" (بدي) instead of "Ureed".
+       - Use "Tab3an" (طبعا), "Ya3ni" (يعني), "Inshallah" (ان شاء الله).
+    4. **PROSODY**: Don't be flat. Be expressive.
+
     # CONTEXT
-    Patient: {patient_name} (Pronounce this correctly using Ammani accent).
+    Patient: {patient_name} (Pronounce carefully).
     Treatment: {treatment}.
     Time: {appointment_time}.
     
-    # OBJECTIVE
-    Your goal is to confirm the appointment. 
-    1. Start by saying hello to {patient_name} warmly.
-    2. Mention the {treatment} at {appointment_time}.
-    3. Ask if they are ready ("Jahiz?").
+    # CONVERSATION FLOW
+    1. Greeting: "Ahlan {patient_name}, ma3ak Sara min 3iyadat Ibtisama. Keefak elyom?"
+    2. Confirmation: "Habeit akked ma3ak maw3ed {treatment} 3a sa3a {appointment_time}."
+    3. Closing: "Tamam, ben-shufak 3ala kheir!"
     
-    # BEHAVIOR
-    - If they say YES: Be happy, say "Mumtaz", call the function `update_lead_status_confirmed`.
-    - If they say NO/CANCEL: Be understanding, say "Ma fi mushkila", call the function `update_lead_status_cancelled`.
-    - Keep sentences SHORT. Don't monologue.
+    # RULES
+    - If user says YES: Call `update_lead_status_confirmed`.
+    - If user says NO: Call `update_lead_status_cancelled`.
     """
 
-    # VAD Setup
     vad_stop_secs = 0.2
     try:
         vad_stop_secs = float(os.getenv("VAD_STOP_SECS") or 0.2)
@@ -516,14 +501,17 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     else:
         vad = cached_vad
 
+    # FIXED: Serializer needs to match Telnyx (8000Hz)
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
         call_control_id=call_control_id,
         api_key=os.getenv("TELNYX_API_KEY"),
         outbound_encoding=inbound_encoding,
         inbound_encoding=inbound_encoding,
-        params=TelnyxFrameSerializer.InputParams(sample_rate=pipeline_sample_rate),
+        params=TelnyxFrameSerializer.InputParams(sample_rate=telnyx_out_sample_rate),
     )
+    
+    # FIXED: Transport audio_out_sample_rate MUST be 8000 for Telnyx
     transport = FastAPIWebsocketTransport(
         websocket=websocket_client,
         params=FastAPIWebsocketParams(
@@ -533,8 +521,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             vad_analyzer=vad,
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_in_sample_rate=pipeline_sample_rate,
-            audio_out_sample_rate=pipeline_sample_rate,
+            audio_in_sample_rate=pipeline_in_sample_rate, 
+            audio_out_sample_rate=telnyx_out_sample_rate, # THIS WAS THE ROBOT VOICE BUG (WAS 16000/24000)
         ),
     )
 
@@ -544,11 +532,10 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             logger.error("USE_MULTIMODAL_LIVE=true but GOOGLE_API_KEY/GEMINI_API_KEY is missing.")
             return
             
-        gemini_in_sample_rate = pipeline_sample_rate
+        gemini_in_sample_rate = pipeline_in_sample_rate
         model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
         model = normalize_gemini_live_model_name(model_env)
         
-        # NOTE: 'Aoede' is often better for warm Arabic, 'Kore' is standard. 
         voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Kore").strip()
         
         from pipecat.services.google.gemini_live.llm import (
@@ -569,7 +556,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         except Exception:
             GeminiModalities = None
             
-        gemini_params = GeminiLiveInputParams(temperature=0.6) # Increased temp slightly for naturalness
+        gemini_params = GeminiLiveInputParams(temperature=0.6)
         gemini_language_env = (os.getenv("GEMINI_LIVE_LANGUAGE") or "ar").strip()
         if gemini_language_env:
             try:
@@ -595,7 +582,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             gemini_kwargs = {
                 "api_key": api_key,
                 "voice_id": voice_id,
-                "system_instruction": system_prompt, # NEW PROMPT PASSED HERE
+                "system_instruction": system_prompt,
                 "params": gemini_params,
                 "inference_on_context_initialization": True,
             }
@@ -639,8 +626,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         
         mm_perf = MultimodalPerf()
         
-        # --- INITIAL TRIGGER ---
-        # Instead of a script, we trigger the persona to start.
+        # Trigger
         mm_context = LLMContext(messages=[
             {"role": "user", "content": f"Greeting time. Speak to {patient_name} now in Jordanian Arabic."}
         ])
@@ -764,7 +750,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             if user_stop_trigger is not None:
                 user_stop_trigger.cancel_pending()
 
-        # Failsafe tasks (optional but good for stability)
         async def multimodal_first_turn_failsafe():
             timeout_s = 8.0
             await asyncio.sleep(timeout_s)
@@ -807,4 +792,3 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("Classic STT/Vertex/TTS pipeline has been removed. Set USE_MULTIMODAL_LIVE=true.")
     return
-
