@@ -309,7 +309,7 @@ class LeadStatusTranscriptFallback(FrameProcessor):
 def normalize_gemini_live_model_name(model: str) -> str:
     model = (model or "").strip()
     if not model:
-        return "models/gemini-2.0-flash-live-001"
+        return "models/gemini-2.5-flash-native-audio-preview-12-2025"
     if model.startswith("models/"):
         return model
     if "/" in model:
@@ -662,7 +662,7 @@ Sara—the pinnacle of native Ammani excellence. Deliver phonetic-perfect, ultra
                 if "is not found for API version v1beta" in msg:
                     logger.error(
                         "GeminiLive model/version mismatch. If using Google AI Studio API key, use a Google Live model like "
-                        "models/gemini-2.0-flash-live-001 or models/gemini-2.5-flash-native-audio-preview-12-2025. "
+                        "models/gemini-2.5-flash-native-audio-preview-12-2025 or models/gemini-2.5-flash-native-audio-preview-12-2025. "
                         "If needed, set GEMINI_LIVE_HTTP_API_VERSION=v1alpha."
                     )
                 logger.error(f"GeminiLive rejected model/key: {msg}")
@@ -820,3 +820,4 @@ Sara—the pinnacle of native Ammani excellence. Deliver phonetic-perfect, ultra
         return
     logger.error("Classic STT/Vertex/TTS pipeline has been removed. Set USE_MULTIMODAL_LIVE=true.")
     return
+
