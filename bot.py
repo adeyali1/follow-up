@@ -24,7 +24,7 @@ import json
 import time
 
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
-BOT_BUILD_ID = "2026-01-21-jordanian-native-v2"
+BOT_BUILD_ID = "2026-01-21-saudi-ahmed-mawsool-v1"
 _VAD_MODEL = {"value": None}
 
 class MultimodalPerf(FrameProcessor):
@@ -319,7 +319,6 @@ class LeadStatusTranscriptFallback(FrameProcessor):
 def normalize_gemini_live_model_name(model: str) -> str:
     model = (model or "").strip()
     if not model:
-        # Prefer the experimental flash model for best latency/human-feel
         return "models/gemini-2.0-flash-exp" 
     if model.startswith("models/"):
         return model
@@ -331,13 +330,7 @@ def normalize_customer_name_for_ar(name: str) -> str:
     raw = (name or "").strip()
     if not raw:
         return ""
-    lowered = raw.lower()
-    # Simple mapping to Arabic script to help pronunciation
-    if lowered == "oday": return "عدي"
-    if lowered == "mohammad": return "محمد"
-    if lowered == "ahmad": return "أحمد"
-    if lowered == "khaled": return "خالد"
-    if lowered == "sara": return "سارة"
+    # Simplified handling for Saudi names
     return raw
 
 async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
@@ -371,18 +364,18 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     except Exception:
         pipeline_sample_rate = 16000
 
+    # Adjusted context for B2B Sales
     if 'patient_name' not in lead_data:
-        lead_data['patient_name'] = lead_data.get('customer_name', 'المريض')
+        lead_data['patient_name'] = lead_data.get('customer_name', 'يا غالي')
     if 'treatment' not in lead_data:
-        lead_data['treatment'] = lead_data.get('order_items', 'تنظيف أسنان') 
+        lead_data['treatment'] = lead_data.get('order_items', 'ديمو منصة موصول') 
     if 'appointment_time' not in lead_data:
-        lead_data['appointment_time'] = lead_data.get('delivery_time', 'الساعة 11:00') 
+        lead_data['appointment_time'] = lead_data.get('delivery_time', 'خلال هالأسبوع') 
     if 'id' not in lead_data:
         lead_data['id'] = 'mock-lead-id'
 
     logger.info(f"Using lead_data: {lead_data}")
 
-    # 0. Handle Telnyx Handshake
     stream_id = "telnyx_stream_placeholder"
     inbound_encoding = "PCMU"
     stream_sample_rate = 8000
@@ -394,19 +387,13 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             if "media_format" in msg:
                 encoding = msg["media_format"].get("encoding", "").upper()
                 stream_sample_rate = int(msg["media_format"].get("sample_rate", stream_sample_rate) or stream_sample_rate)
-                if encoding == "G729":
-                    logger.error("CRITICAL: Telnyx is sending G.729 audio. Switch to PCMU.")
-                elif encoding == "PCMA":
-                    inbound_encoding = "PCMA"
-                elif encoding == "PCMU":
-                    inbound_encoding = "PCMU"
+                if encoding == "PCMA": inbound_encoding = "PCMA"
+                elif encoding == "PCMU": inbound_encoding = "PCMU"
             elif "start" in msg and "media_format" in msg["start"]:
                 encoding = msg["start"]["media_format"].get("encoding", "").upper()
                 stream_sample_rate = int(msg["start"]["media_format"].get("sample_rate", stream_sample_rate) or stream_sample_rate)
-                if encoding == "PCMA":
-                    inbound_encoding = "PCMA"
-                elif encoding == "PCMU":
-                    inbound_encoding = "PCMU"
+                if encoding == "PCMA": inbound_encoding = "PCMA"
+                elif encoding == "PCMU": inbound_encoding = "PCMU"
             if "stream_id" in msg:
                 stream_id = msg["stream_id"]
                 break
@@ -418,30 +405,20 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                     stream_id = msg["stream_id"]
                     break
     except Exception as e:
-        logger.error(f"Failed to capture stream_id from initial message: {e}")
+        logger.error(f"Failed to capture stream_id: {e}")
 
-    patient_name = normalize_customer_name_for_ar(lead_data.get("patient_name", "يا غالية"))
-    treatment = lead_data.get("treatment", "الموعد")
-    appointment_time = lead_data.get("appointment_time", "بكرا")
+    patient_name = normalize_customer_name_for_ar(lead_data.get("patient_name", ""))
+    
+    # --- SAUDI GREETING ---
+    greeting_text = "هلا والله! معك أحمد من شركة موصول، عساك طيب؟"
 
-    # --- ENHANCED JORDANIAN GREETING ---
-    # Natural Ammani opening. 
-    greeting_text = f"مرحبا، يعطيك العافية. معي {patient_name}؟"
-
-    # VAD Settings
     vad_stop_secs = 0.2
     try:
         vad_stop_secs = float(os.getenv("VAD_STOP_SECS") or 0.2)
-    except Exception:
-        vad_stop_secs = 0.2
-    try:
         vad_min_volume = float(os.getenv("VAD_MIN_VOLUME") or 0.6)
-    except Exception:
-        vad_min_volume = 0.6
-    try:
         vad_confidence = float(os.getenv("VAD_CONFIDENCE") or 0.7)
     except Exception:
-        vad_confidence = 0.7
+        pass
 
     vad = None
     cached_vad = _VAD_MODEL.get("value")
@@ -475,11 +452,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
-    # --- 100% ACCURATE NATIVE AMMANI SYSTEM PROMPT ---
-    # This prompt forces the LLM to use specific Jordanian vocabulary 
-    # and strictly forbids Robotic/MSA/GCC patterns.
-    system_prompt = f"""
-""أنت "أحمد"، خبير مبيعات محترف من "موصول" (Mawsool at mawsool.tech). لهجتك سعودية (نجدية/بيضاء) قوية وطبيعية جداً.
+    # --- UPDATED SAUDI SYSTEM PROMPT ---
+    system_prompt = """أنت "أحمد"، خبير مبيعات محترف من "موصول" (Mawsool at mawsool.tech). لهجتك سعودية (نجدية/بيضاء) قوية وطبيعية جداً.
 
 **أسلوبك:**
 - صوتك مليء بالطاقة والثقة، بس بدون تكلف.
@@ -503,20 +477,15 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
 رابط الديمو: https://calendar.app.google/EutcxTBmd9zRtYrv9"""
 
-
-"""
-
     if use_multimodal_live:
         api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         if not api_key:
-            logger.error("USE_MULTIMODAL_LIVE=true but GOOGLE_API_KEY/GEMINI_API_KEY is missing.")
+            logger.error("GOOGLE_API_KEY/GEMINI_API_KEY is missing.")
             return
+        
         gemini_in_sample_rate = pipeline_sample_rate
         model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
         model = normalize_gemini_live_model_name(model_env)
-        
-        # --- FORCE FEMALE VOICE ("Aoede") FOR HUMAN FEEL ---
-        # "Charon" is male/deep. "Aoede" is the best female voice for Arabic.
         voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Aoede").strip()
 
         from pipecat.services.google.gemini_live.llm import (
@@ -525,32 +494,26 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         )
         http_api_version = (os.getenv("GEMINI_LIVE_HTTP_API_VERSION") or "v1beta").strip()
         http_options = None
-        if http_api_version:
-            try:
-                from google.genai.types import HttpOptions
-                http_options = HttpOptions(api_version=http_api_version)
-            except Exception:
-                http_options = None
+        try:
+            from google.genai.types import HttpOptions
+            http_options = HttpOptions(api_version=http_api_version)
+        except Exception:
+            pass
+        
         try:
             from pipecat.services.google.gemini_live.llm import GeminiModalities
         except Exception:
             GeminiModalities = None
         
-        # --- INCREASE TEMPERATURE FOR NATURAL FLOW ---
-        # 0.3 is too robotic. 0.6 allows for natural fillers and intonation changes.
         gemini_params = GeminiLiveInputParams(temperature=0.6)
-       
         try:
             gemini_params.sample_rate = gemini_in_sample_rate
-        except Exception:
-            pass
-        try:
             if GeminiModalities is not None:
                 gemini_params.modalities = GeminiModalities.AUDIO
         except Exception:
             pass
         
-        logger.info(f"GeminiLive: model={model}, voice={voice_id}, temp=0.6")
+        logger.info(f"GeminiLive Saudi Mode: model={model}, voice={voice_id}, temp=0.6")
 
         try:
             gemini_kwargs = {
@@ -566,27 +529,25 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 gemini_kwargs["model"] = model
             gemini_live = GeminiLiveService(**gemini_kwargs)
         except Exception as e:
-            logger.error(f"GeminiLive init failed. ({e})")
+            logger.error(f"GeminiLive init failed: {e}")
             return
 
         call_end_delay_s = 2.5
         lead_finalized = {"value": None}
 
         async def confirm_appointment(params: FunctionCallParams):
-            logger.info(f"Tool: Confirming appointment for {lead_data['id']}")
+            logger.info(f"Tool: Confirming Demo/Appointment for {lead_data['id']}")
             lead_finalized["value"] = "CONFIRMED"
-            reason = params.arguments.get("reason", None)
             update_lead_status(lead_data["id"], "CONFIRMED") 
-            await params.result_callback({"value": "Confirmed.", "reason": reason})
+            await params.result_callback({"value": "Confirmed."})
             if call_control_id:
                 asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
 
         async def cancel_appointment(params: FunctionCallParams):
-            logger.info(f"Tool: Cancelling appointment for {lead_data['id']}")
+            logger.info(f"Tool: Cancelling for {lead_data['id']}")
             lead_finalized["value"] = "CANCELLED"
-            reason = params.arguments.get("reason", None)
             update_lead_status(lead_data["id"], "CANCELLED") 
-            await params.result_callback({"value": "Cancelled.", "reason": reason})
+            await params.result_callback({"value": "Cancelled."})
             if call_control_id:
                 asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
 
@@ -594,7 +555,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         gemini_live.register_function("update_lead_status_cancelled", cancel_appointment)
 
         mm_perf = MultimodalPerf()
-        mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ"}])
+        # Initial message to trigger the bot to say the Saudi greeting
+        mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ المكالمة وقدم نفسك بلهجة سعودية."}])
         
         user_mute_strategies = []
         mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
@@ -607,12 +569,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
         stop_timeout_s = 0.8
         start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
-        if (os.getenv("MULTIMODAL_USE_VAD_TURN_START") or "false").lower() == "true":
-            try:
-                from pipecat.turns.user_start import VADUserTurnStartStrategy
-                start_strategies = [VADUserTurnStartStrategy(enable_interruptions=False)]
-            except Exception:
-                pass
         stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=stop_timeout_s)]
         
         mm_aggregators = LLMContextAggregatorPair(
@@ -639,31 +595,23 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             finalized_ref=lead_finalized,
         )
         
-        enable_run_on_user_stop = (os.getenv("MULTIMODAL_RUN_ON_USER_STOP") or "true").lower() == "true"
-        user_stop_trigger = None
-        if enable_run_on_user_stop:
-            user_stop_trigger = MultimodalUserStopRunTrigger(
-                delay_s=float(os.getenv("MULTIMODAL_RUN_ON_USER_STOP_DELAY_S") or 0.05),
-                min_interval_s=float(os.getenv("MULTIMODAL_RUN_MIN_INTERVAL_S") or 0.25),
-            )
-
-        inbound_audio_logger = InboundAudioLogger()
-        turn_state_logger = TurnStateLogger()
-        outbound_audio_logger = OutboundAudioLogger()
-        audio_chunker = AudioFrameChunker(chunk_ms=int(os.getenv("AUDIO_OUT_CHUNK_MS") or 0))
+        user_stop_trigger = MultimodalUserStopRunTrigger(
+            delay_s=float(os.getenv("MULTIMODAL_RUN_ON_USER_STOP_DELAY_S") or 0.05),
+            min_interval_s=float(os.getenv("MULTIMODAL_RUN_MIN_INTERVAL_S") or 0.25),
+        )
 
         pipeline = Pipeline(
             [
                 transport.input(),
-                inbound_audio_logger,
+                InboundAudioLogger(),
                 mm_aggregators.user(),
-                *([user_stop_trigger] if user_stop_trigger is not None else []),
+                user_stop_trigger,
                 gemini_live,
                 transcript_trigger,
                 transcript_fallback,
-                turn_state_logger,
-                outbound_audio_logger,
-                audio_chunker,
+                TurnStateLogger(),
+                OutboundAudioLogger(),
+                AudioFrameChunker(chunk_ms=int(os.getenv("AUDIO_OUT_CHUNK_MS") or 0)),
                 mm_perf,
                 transport.output(),
                 mm_aggregators.assistant(),
@@ -672,8 +620,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
         task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
         transcript_trigger.set_queue_frames(task.queue_frames)
-        if user_stop_trigger is not None:
-            user_stop_trigger.set_queue_frames(task.queue_frames)
+        user_stop_trigger.set_queue_frames(task.queue_frames)
 
         runner = PipelineRunner()
         did_trigger_initial_run = {"value": False}
@@ -681,27 +628,21 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
         @transport.event_handler("on_client_connected")
         async def _on_client_connected(_transport, _client):
-            if not call_alive["value"]:
-                return
-            if did_trigger_initial_run["value"]:
+            if not call_alive["value"] or did_trigger_initial_run["value"]:
                 return
             did_trigger_initial_run["value"] = True
-            logger.info("Multimodal: client connected")
+            logger.info("Multimodal: client connected - starting Saudi Sales Bot")
 
         @transport.event_handler("on_client_disconnected")
         async def _on_client_disconnected(_transport, _client):
             call_alive["value"] = False
             transcript_trigger.cancel_pending()
-            if user_stop_trigger is not None:
-                user_stop_trigger.cancel_pending()
+            user_stop_trigger.cancel_pending()
 
-        # Failsafe tasks
         async def multimodal_first_turn_failsafe():
             await asyncio.sleep(8.0)
-            if not call_alive["value"]:
-                return
-            if _MM.get("last_bot_started_ts") is None:
-                logger.warning("Failsafe: re-triggering LLMRunFrame")
+            if call_alive["value"] and _MM.get("last_bot_started_ts") is None:
+                logger.warning("Failsafe: triggering initial LLM run")
                 await task.queue_frames([LLMRunFrame()])
 
         asyncio.create_task(multimodal_first_turn_failsafe())
@@ -709,6 +650,5 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         await runner.run(task)
         return
 
-    logger.error("Set USE_MULTIMODAL_LIVE=true")
+    logger.error("USE_MULTIMODAL_LIVE must be true")
     return
-
