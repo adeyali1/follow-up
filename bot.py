@@ -227,7 +227,7 @@ class InboundAudioLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 class AudioFrameChunker(FrameProcessor):
-    def __init__(self, *, chunk_ms: int = 20):
+    def __init__(self, *, chunk_ms: int = 0):
         super().__init__()
         self._chunk_ms = int(chunk_ms)
         self._pace = (os.getenv("AUDIO_OUT_PACE") or "true").lower() == "true"
@@ -463,7 +463,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     patient_name = normalize_customer_name_for_ar(lead_data.get("patient_name", ""))
 
-    greeting_text = "هلا والله! معك أحمد من شركة موصول، عساك طيب؟"
+    greeting_text = "هلا والله! معك خالد من شركة موصول، عساك طيب؟"
 
     # Optimized VAD parameters for low latency and accurate detection
     vad_stop_secs = 0.15  # Reduced from 0.2 for faster response
@@ -737,3 +737,4 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
