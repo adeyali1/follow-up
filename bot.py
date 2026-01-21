@@ -238,8 +238,8 @@ class LeadStatusTranscriptFallback(FrameProcessor):
         text = (text or "").strip().lower()
         for ch in ["\n", "\r", "\t", ".", ",", "!", "?", "؟", "،", "؛", "\"", "'"]:
             text = text.replace(ch, " ")
-        while " " in text:
-            text = text.replace(" ", " ")
+        while "  " in text:
+            text = text.replace("  ", " ")
         return text
     @staticmethod
     def _is_confirm(text: str) -> bool:
@@ -309,7 +309,7 @@ class LeadStatusTranscriptFallback(FrameProcessor):
 def normalize_gemini_live_model_name(model: str) -> str:
     model = (model or "").strip()
     if not model:
-        return "models/gemini-2.0-flash-exp"
+        return "models/gemini-2.0-flash-live-001"
     if model.startswith("models/"):
         return model
     if "/" in model:
@@ -319,23 +319,13 @@ def build_multimodal_opening_message(greeting_text: str) -> str:
     greeting_text = (greeting_text or "").strip()
     return greeting_text
 def normalize_customer_name_for_ar(name: str) -> str:
-    if not name:
-        return "عزيزي"
-    name = name.strip().lower()
-    mapping = {
-        "oday": "عُدَي",
-        "odai": "عُدَي",
-        "mohammad": "محمد",
-        "mohamed": "محمد",
-        "ahmad": "أحمد",
-        "ahmed": "أحمد",
-        "omar": "عمر",
-        "ali": "علي",
-        "yousef": "يوسف",
-        "yousef": "يوسف",
-        "hijazi": "حجازي",
-    }
-    return mapping.get(name, name)
+    raw = (name or "").strip()
+    if not raw:
+        return raw
+    lowered = raw.lower()
+    if lowered == "oday":
+        return "عدي"
+    return raw
 async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
     if not call_control_id:
         return
@@ -370,19 +360,21 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     if 'patient_name' not in lead_data:
         lead_data['patient_name'] = lead_data.get('customer_name', 'المريض')
     if 'treatment' not in lead_data:
-        lead_data['treatment'] = lead_data.get('order_items', 'تنظيف أسنان') # Mock/fallback
+        lead_data['treatment'] = lead_data.get('order_items', 'تنظيف أسنان')  # Mock/fallback
     if 'appointment_time' not in lead_data:
-        lead_data['appointment_time'] = lead_data.get('delivery_time', 'الساعة 11:00') # Mock/fallback
+        lead_data['appointment_time'] = lead_data.get('delivery_time', 'الساعة 11:00')  # Mock/fallback
     if 'id' not in lead_data:
-        lead_data['id'] = 'mock-lead-id' # For demo
-    logger.info(f"Using lead_data: {lead_data}") # Debug log to see what's used
+        lead_data['id'] = 'mock-lead-id'  # For demo
+
+    logger.info(f"Using lead_data: {lead_data}")  # Debug log to see what's used
+
     # 0. Handle Telnyx Handshake to get stream_id
     stream_id = "telnyx_stream_placeholder"
     inbound_encoding = "PCMU"
     stream_sample_rate = 8000
     try:
         logger.info("Waiting for Telnyx 'start' event with stream_id...")
-        for _ in range(3): # Try up to 3 messages
+        for _ in range(3):  # Try up to 3 messages
             msg_text = await websocket_client.receive_text()
             logger.info(f"Received Telnyx message: {msg_text}")
             msg = json.loads(msg_text)
@@ -432,7 +424,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     except Exception as e:
         logger.error(f"Failed to capture stream_id from initial message: {e}")
     patient_name = normalize_customer_name_for_ar(lead_data.get("patient_name", "المريض"))
-    greeting_text = f"السلام عليكم، معك سارة من عيادة أسنان الابتسامة. كيف حالك يا {patient_name}؟"
+    greeting_text = f"السلام عليكم، معك سارة من عيادة أسنان الابتسامة. معي يا {patient_name}؟"
     vad_stop_secs = 0.2
     try:
         vad_stop_secs = float(os.getenv("VAD_STOP_SECS") or 0.2)
@@ -479,39 +471,46 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     treatment = lead_data.get("treatment", "تنظيف أسنان")
     appointment_time = lead_data.get("appointment_time", "الساعة 11:00")
     system_prompt = f"""
-# ROLE: THE BEST AI VOICE JORDANIAN DENTAL TREATMENT COORDINATOR
-You are Sara, a professional Jordanian dental coordinator speaking natural Ammani Arabic.
-# تعليمات النظام للبوت الصوتي – Sara
-تعليمات صوتية مهمة (إلزامي):
-- احكي أردني عمّاني فقط، طبيعي ودافئ
-- ممنوع الفصحى (Fuṣḥā)
-- ممنوع اللهجة المصرية أو أي لهجة أجنبية
-- الجمل قصيرة وطبيعية، لا تُطيل الكلام
-- النبرة أنثوية، دافئة، واثقة
-- احكي كأنك موظفة استقبال في عيادة أسنان في عمّان
-- لا تستخدم كلمات أجنبية إلا إذا استخدمها المريض أولاً
-كلمات أردنية مفضلة:
-هسا، تمام، ماشي، بدي، رح، ليش، شو، معي؟
-كلمات ممنوعة:
-دلوقتي، عايز، حضرتك، سوف، ماذا
-# التحية (MUST – EXACT)
-- ابدأ دائمًا بالتحية التالية (لا تغيرها):
-"{greeting_text}"
-# سير المكالمة – Workflow
-1) بناء علاقة مع المريض والتأكد من هويته:
-   - بعد التحية واستجابة المريض، قل:
-     "شكراً إنك معي، {patient_name}. بدي أتأكد إنك جاهز لموعدك اللي رح يغير ابتسامتك."
-2) تأكيد العلاج:
-   - قدم التفاصيل بصوت جذاب:
-     "{patient_name}، موعدك لـ {treatment} ع الساعة {appointment_time} رح يكون خطوة كبيرة نحو أسنان صحية وابتسامة مذهلة. بنعتمد عليه؟"
-   - أبرز الفوائد: "رح تشعر بالفرق فوراً، بدون ألم، مع أفضل الدكاترة."
-3) إذا أكد المريض:
-   - حدث حالة المريض على CONFIRMED فورًا
-   - قل: "ممتاز يا {patient_name}! هسا برتب كل شيء مع الدكتور، ورح نضمن إن تجربتك تكون مثالية. شكراً على ثقتك فينا—بتستاهل أحلى ابتسامة!"
-4) إذا ألغى المريض:
-   - حدث حالة المريض على CANCELLED فورًا
-   - قل: "ماشي يا غالي، حصل خير. إذا غيرت رأيك، اتصل فينا أي وقت. صحتك أولويتنا."
-5) إعادة الجدولة (مثل
+# ROLE: THE SUPREME NATIVE AMMANI JORDANIAN DENTAL TREATMENT COORDINATOR
+You are Sara, the absolute best AI voice agent in the world for dental coordination—a true native Ammani Jordanian woman born and raised in Amman, speaking with flawless, authentic Ammani Levantine Arabic dialect. Your pronunciation is perfect: roll the 'r's softly, emphasize 'q' as 'g' in words like 'galb' for 'qalb', use glottal stops naturally, and handle names with precise Jordanian phonetics (e.g., 'Muhammad' as 'Mhamad' with soft 'h', 'Aisha' as 'Aysha' with elongated 'ay'). Avoid any robotic cadence: infuse every word with natural prosody, varying pitch for warmth, slight breathy pauses for thoughtfulness, and Ammani idioms/fillers like 'ya'ani', 'shoof', 'ahlan wa sahlan' to make speech flow like a real conversation over mint tea.
+
+# ULTIMATE PRINCIPLES FOR PERFECT, NON-ROBOTIC ARABIC
+- **Flawless Native Ammani Pronunciation & Dialect**: 100% pure Ammani—soft, melodic, with urban Jordanian flair. Pronounce names authentically: Break them phonetically if needed (e.g., for 'Oday' say 'Uday' with emphasis on 'U'). Use dialect-specific grammar: 'biddi' not 'uridu', 'hala' for greetings, 'mashy' for agreement.
+  - Enhanced Examples: "Ya'ani, biddi ashrah lak kul el-khatwat u tkon murtāh." (Natural filler + flow). "Shoof, el-'ilaj hāda rāh ykhalli asnānak zayy el-lu'lu'."
+  - Phonetic Guidance: For names, adapt to Ammani: 'Ahmed' as 'Ahmad' with guttural 'h', 'Fatima' as 'Fatmeh' with soft 'eh'. Never anglicize—keep Arabic essence.
+  - Forbidden: Generic MSA (e.g., no 'maadha', use 'shoo'); no stiff pauses; no monotone—vary speed/tone like a lively Ammani chat.
+- **Hyper-Natural Delivery**: Sound human: Add subtle laughs ('hehe'), empathetic sighs, or affirmations ('aywa, sah'). Respond dynamically to patient's speech—mirror their energy, echo words for connection. No repetition; improvise naturally.
+- **Professional Mastery with Warmth**: Brief yet engaging (replies 8-12 words avg), deeply empathetic. Active listening: "Aywa, sam'it kalaamak, ya'ani..." Silence? Soft: "Ma'i ya habibi?" then pause naturally.
+- **Captivating Calls**: Weave storytelling: "Btakhayyali ibtisāmtak ba'd el-'ilaj, zayy njūm 'Amān!" Address fears proactively, build thrill.
+- **Patient-First Excellence**: Personalize: Use name phonetically once per turn for intimacy. Empower: "Inti el-boss, shoo rayik nāmshi hāda el-tarīq?"
+
+# GREETING (MUST - PRECISE, PHONETIC NATURAL)
+- Exact First: "{greeting_text}" (Pronounce name with Ammani flair, e.g., 'Ya Mohammad' as 'Ya Mhamad').
+- Natural Pause: Wait, then flow based on response.
+
+# WORKFLOW (FLUID, PHONETICALLY PERFECT)
+1) **Rapport Building**: "Ahlan, shukran innak jawabti. {patient_name} (phonetic: e.g., 'Fatmeh' as 'Fat-meh'), biddi atākkad innak mustarīha w jāhza nḥki 'an mo'īdak el-li rāh yjīb el-farah."
+2) **Phonetic Confirmation**: "{patient_name} (native pron.), mo'īdak li-{treatment} 'a sā'at {appointment_time} rāh ykūn tajruba sāhlah w murīḥa, ya'ani bla waja' w bi-ahsan tekniyāt. Shoo rāyik, nāmshi fīh? Ah?"
+   - Benefits: "Rāh tḥissi bil-farq fawran, ibtisāma nāṣi'a w thiqa akbar."
+3) **Confirmed**:
+   - Silent: Call update_lead_status_confirmed IMMEDIATELY (no verbal mention).
+   - Natural: "Mumtāz ya {patient_name}! Ah, hassa brattib el-dunya ma' el-doktūr, w rāh naḍmin kul shi yimshi zayy el-sā'ah. Shukran 'ala thiqtak—btistahli ahla mu'āmala!"
+4) **Cancelled**:
+   - Silent: Call update_lead_status_cancelled IMMEDIATELY.
+   - Empathetic: "Māshi ya ghāliya, ya'ani ḥaṣal khayr. Law ghayyarti rā'yik, iṣtīlī fīna ay waqt. Ṣiḥḥtik 'indana awlawīya, ah."
+5) **Reschedule**: "Ah, tamām li-bukra. Shoo el-waqt el-li ynāsibik akthar? Ya'ani 10 el-ṣubḥ wala 3 el-'aṣr?" Suggest, confirm phonetically.
+6) **Objections**: "Shoofi, el-'ilāj sāhl khāliṣ, ya'ani mish rāh tḥissī bi-waja'. Biddi ashraḥ lak kul khatwa 'ashān tkūni muṭma'innah."
+7) **Close**: "Fi ḥāja tānīya biddik tḥki 'anha? Ma' el-salāma ya 'azīzti, w nshūfak garīb bi-idhn Allāh!"
+
+# CONTEXT & SILENT ENHANCEMENTS
+- Patient: {patient_name} (Always pronounce natively: Guide as phonetic in mind, e.g., 'Sara' as 'Sārah' with soft 'ah').
+- Treatment: {treatment} (Vivid phonetic: e.g., 'tanẓīf asnān' as 'tanḍīf asnānak' with emphasis).
+- Time: {appointment_time} (Natural: 'Sā'at ḥidāsh' as 'Sā't el-ḥdāsh').
+- Silent: No mentions of functions/updates—pure dialogue.
+- Clinic: Modern, no-pain, top docs—weave organically.
+- Edges: Clarify: "Ah, biddi afham aḥsan, shoo bil-ḍabṭ fi bālak?" Human always.
+
+Sara—the pinnacle of native Ammani excellence. Deliver phonetic-perfect, ultra-natural Arabic calls: Warm, flowing, zero robotic—pure Jordanian soul.
 """
     if use_multimodal_live:
         api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
@@ -521,7 +520,7 @@ You are Sara, a professional Jordanian dental coordinator speaking natural Amman
         gemini_in_sample_rate = pipeline_sample_rate
         model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
         model = normalize_gemini_live_model_name(model_env) if model_env else None
-        voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Kore").strip()
+        voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Charon").strip()
         from pipecat.services.google.gemini_live.llm import (
             GeminiLiveLLMService as GeminiLiveService,
             InputParams as GeminiLiveInputParams,
@@ -538,16 +537,8 @@ You are Sara, a professional Jordanian dental coordinator speaking natural Amman
             from pipecat.services.google.gemini_live.llm import GeminiModalities
         except Exception:
             GeminiModalities = None
-        gemini_params = GeminiLiveInputParams(temperature=0.55)
-        gemini_language_env = (os.getenv("GEMINI_LIVE_LANGUAGE") or "ar").strip()
-        if gemini_language_env:
-            try:
-                if gemini_language_env.lower().startswith("en"):
-                    gemini_params.language = Language.EN
-                elif gemini_language_env.lower().startswith("ar"):
-                    gemini_params.language = Language.AR
-            except Exception:
-                pass
+        gemini_params = GeminiLiveInputParams(temperature=0.3)
+       
         try:
             gemini_params.sample_rate = gemini_in_sample_rate
         except Exception:
@@ -592,7 +583,7 @@ You are Sara, a professional Jordanian dental coordinator speaking natural Amman
             lead_finalized["value"] = "CONFIRMED"
             reason = params.arguments.get("reason", None)
             # For demo: Don't call real update, just log
-            # update_lead_status(lead_data["id"], "CONFIRMED") # Comment out for demo
+            # update_lead_status(lead_data["id"], "CONFIRMED")  # Comment out for demo
             await params.result_callback({"value": "Appointment confirmed successfully.", "reason": reason})
             if call_control_id:
                 asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
@@ -601,7 +592,7 @@ You are Sara, a professional Jordanian dental coordinator speaking natural Amman
             lead_finalized["value"] = "CANCELLED"
             reason = params.arguments.get("reason", None)
             # For demo: Don't call real update, just log
-            # update_lead_status(lead_data["id"], "CANCELLED") # Comment out for demo
+            # update_lead_status(lead_data["id"], "CANCELLED")  # Comment out for demo
             await params.result_callback({"value": "Appointment cancelled.", "reason": reason})
             if call_control_id:
                 asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
@@ -663,7 +654,7 @@ You are Sara, a professional Jordanian dental coordinator speaking natural Amman
                 if "is not found for API version v1beta" in msg:
                     logger.error(
                         "GeminiLive model/version mismatch. If using Google AI Studio API key, use a Google Live model like "
-                        "models/gemini-2.0-flash-exp or models/gemini-2.5-flash-native-audio-preview-12-2025. "
+                        "models/gemini-2.0-flash-live-001 or models/gemini-2.5-flash-native-audio-preview-12-2025. "
                         "If needed, set GEMINI_LIVE_HTTP_API_VERSION=v1alpha."
                     )
                 logger.error(f"GeminiLive rejected model/key: {msg}")
