@@ -520,7 +520,7 @@ You are Sara—the gold standard. Make every call fascinating, professional, and
         gemini_in_sample_rate = pipeline_sample_rate
         model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
         model = normalize_gemini_live_model_name(model_env) if model_env else None
-        voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Charon").strip()
+        voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Aoede").strip()
         from pipecat.services.google.gemini_live.llm import (
             GeminiLiveLLMService as GeminiLiveService,
             InputParams as GeminiLiveInputParams,
@@ -820,4 +820,5 @@ You are Sara—the gold standard. Make every call fascinating, professional, and
         return
     logger.error("Classic STT/Vertex/TTS pipeline has been removed. Set USE_MULTIMODAL_LIVE=true.")
     return
+
 
