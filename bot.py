@@ -1,4 +1,3 @@
---- START OF FILE Paste January 21, 2026 - 3:02PM ---
 
 import os
 import asyncio
@@ -792,3 +791,4 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("Classic STT/Vertex/TTS pipeline has been removed. Set USE_MULTIMODAL_LIVE=true.")
     return
+
