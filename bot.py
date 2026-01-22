@@ -567,7 +567,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         gemini_in_sample_rate = pipeline_sample_rate
         model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
         model = normalize_gemini_live_model_name(model_env)
-        voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Sadachbia").strip()
+        voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Aoede").strip()
 
         from pipecat.services.google.gemini_live.llm import (
             GeminiLiveLLMService as GeminiLiveService,
@@ -743,6 +743,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
