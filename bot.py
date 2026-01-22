@@ -576,8 +576,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             InputParams as GeminiLiveInputParams,
         )
 
-
-
         http_api_version = (os.getenv("GEMINI_LIVE_HTTP_API_VERSION") or "v1beta").strip()
         http_options = None
 
@@ -746,6 +744,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
