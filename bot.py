@@ -524,10 +524,10 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             audio_out_sample_rate=pipeline_sample_rate,
         ),
     )
-
-
+    
+    
     # OPTIMIZED SAUDI (NAJDI) SYSTEM PROMPT V3
-  system_prompt = """
+    system_prompt = """
     **ROLE & IDENTITY:**
     - Name: Khaled (خالد).
     - Position: Relationship Manager at "Mawsool" (موصول).
@@ -747,4 +747,5 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
