@@ -503,7 +503,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         params=TelnyxFrameSerializer.InputParams(sample_rate=pipeline_sample_rate),
     )
 
-       transport = FastAPIWebsocketTransport(
+    transport = FastAPIWebsocketTransport(
         websocket=websocket_client,
         params=FastAPIWebsocketParams(
             serializer=serializer,
@@ -742,6 +742,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
