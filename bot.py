@@ -3,31 +3,36 @@ import asyncio
 import aiohttp
 from urllib.parse import quote
 from loguru import logger
+import json
+import time
+
+# --- PIPECAT IMPORTS ---
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.frames.frames import LLMRunFrame
-from pipecat.frames.frames import LLMMessagesAppendFrame
+from pipecat.frames.frames import LLMRunFrame, LLMMessagesAppendFrame, AudioRawFrame, InputAudioRawFrame, TranscriptionFrame
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.frames.frames import AudioRawFrame, InputAudioRawFrame, TranscriptionFrame
 from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy, VADUserTurnStartStrategy
+
+# --- GOOGLE GEMINI IMPORTS (MOVED TO TOP TO FIX NAME_ERROR) ---
+from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, InputParams
+
+# --- SERVICE IMPORTS ---
 from services.supabase_service import update_lead_status
-import json
-import time
 
-# --- Performance Monitoring Globals ---
+# --- PERFORMANCE GLOBALS ---
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
-BOT_BUILD_ID = "2026-01-22-jordan-elite-pro-v6"
-_VAD_MODEL = {"value": None}
+BOT_BUILD_ID = "2026-01-22-jordan-elite-v8-import-fix"
 
+# --- HELPER CLASSES ---
 class MultimodalPerf(FrameProcessor):
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -87,7 +92,7 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
                 if len(text) < 2:
                     await self.push_frame(frame, direction)
                     return
-                # Standard hallucination block list
+                # Hallucination firewall
                 hallucinations = ["ma si problemi", "ma sì problemi", "si", "ok", "thank you", "bye", "you", "okay", "ألو", "alo"]
                 if text.lower() in hallucinations:
                     await self.push_frame(frame, direction)
@@ -194,7 +199,6 @@ class AudioFrameChunker(FrameProcessor):
             await self.push_frame(frame, direction)
             return
         if isinstance(frame, AudioRawFrame) and len(frame.audio) > 0:
-            # Simple chunking logic omitted for brevity, but same as before
             await self.push_frame(frame, direction)
         else:
             await self.push_frame(frame, direction)
@@ -217,6 +221,7 @@ class LeadStatusTranscriptFallback(FrameProcessor):
                     update_lead_status(self._lead_id, "CONFIRMED")
                     if self._call_control_id: asyncio.create_task(hangup_telnyx_call(self._call_control_id, self._call_end_delay_s))
 
+# --- UTILS ---
 async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
     if not call_control_id: return
     telnyx_key = os.getenv("TELNYX_API_KEY")
@@ -230,11 +235,8 @@ async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
             async with session.post(url, headers=headers, json={"reason": "normal_clearing"}): pass
     except: pass
 
-def normalize_gemini_live_model_name(model: str) -> str:
-    return model if "models/" in model else f"models/{model}"
-
-# --- HELPER: NAME MAPPER (Prevents American Accent) ---
 def get_arabic_name(english_name: str) -> str:
+    """Converts common English mock names to Arabic to fix Pronunciation"""
     name_map = {
         "oday": "عُدَيّ",
         "qusai": "قُصَيّ",
@@ -249,21 +251,31 @@ def get_arabic_name(english_name: str) -> str:
     cleaned = english_name.strip().lower()
     return name_map.get(cleaned, english_name) 
 
-async def run_bot(websocket_client, lead_data, call_control_id=None):
-    logger.info(f"Starting JORDAN PRO BOT for: {lead_data.get('id', 'mock')}")
+def normalize_gemini_live_model_name(model: str) -> str:
+    return model if "models/" in model else f"models/{model}"
 
-    # --- 1. DATA PREP ---
+# --- MAIN BOT LOGIC ---
+async def run_bot(websocket_client, lead_data, call_control_id=None):
+    logger.info(f"Starting JORDAN ELITE PRO BOT for: {lead_data.get('id', 'mock')}")
+
+    # 1. Prepare Data
     raw_name = lead_data.get('patient_name', 'يا غالي')
     patient_name_ar = get_arabic_name(raw_name) 
     
     treatment_context = lead_data.get('treatment', 'استشارة أسنان')
-    if "Burger" in treatment_context: 
-        treatment_context = "تركيبات الزيركون"
+    if "Burger" in treatment_context: treatment_context = "تركيبات الزيركون" # Fix weird mock data
 
-    pipeline_sample_rate = 16000
+    # 2. Sample Rate Failsafe
+    try:
+        pipeline_sample_rate = int(os.getenv("PIPELINE_SAMPLE_RATE") or 16000)
+    except:
+        pipeline_sample_rate = 16000
+    if pipeline_sample_rate == 0: pipeline_sample_rate = 16000
+
     stream_id = "telnyx_stream_placeholder"
     inbound_encoding = "PCMU"
     
+    # 3. Stream Capture
     try:
         for _ in range(3):
             msg_text = await websocket_client.receive_text()
@@ -277,12 +289,17 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             elif msg.get("event") == "start" and "stream_id" in msg:
                 stream_id = msg["stream_id"]
                 break
-    except: pass
+    except Exception as e:
+        logger.error(f"Stream capture error: {e}")
 
-    # --- 2. VAD SETTINGS ---
-    # 0.1s start triggers interruption instantly when user speaks.
-    vad = SileroVADAnalyzer(params=VADParams(min_volume=0.1, start_secs=0.1, stop_secs=0.5, confidence=0.5, sample_rate=pipeline_sample_rate))
-    _VAD_MODEL["value"] = vad
+    # 4. VAD Setup (Fresh Instance - No Global Cache)
+    vad = SileroVADAnalyzer(params=VADParams(
+        min_volume=0.1, 
+        start_secs=0.1, 
+        stop_secs=0.5, 
+        confidence=0.5, 
+        sample_rate=pipeline_sample_rate
+    ))
 
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
@@ -307,9 +324,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
-    # ---------------------------------------------------------------------
-    # SYSTEM PROMPT: PROFESSIONAL ELITE CLINIC
-    # ---------------------------------------------------------------------
+    # 5. System Prompt: Professional Jordanian
     system_prompt = f"""
     **ROLE & PERSONA:**
     - Name: Sarah (سارة).
@@ -348,28 +363,33 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     use_multimodal_live = os.getenv("USE_MULTIMODAL_LIVE", "true").lower() == "true"
     if use_multimodal_live:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key: return
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not api_key: 
+            logger.error("API Key missing")
+            return
 
-        # VOICE: "Kore" is the best balance of clear articulation and human tone for Arabic.
+        # Voice: "Kore" is best for clear Arabic
         voice_id = "Kore" 
-        model = "models/gemini-2.0-flash-exp"
-
-        from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, InputParams
+        model_env = "models/gemini-2.0-flash-exp"
+        model = normalize_gemini_live_model_name(model_env)
         
-        # Temp 0.6 prevents "Fusha" drift while keeping conversation dynamic
-        gemini_params = InputParams(temperature=0.6) 
+        # Temp 0.6 balances Professionalism with Natural Flow
+        gemini_params = InputParams(temperature=0.6)
 
-        gemini_live = GeminiLiveService(
-            api_key=api_key,
-            model=model,
-            voice_id=voice_id,
-            system_instruction=system_prompt,
-            params=gemini_params,
-            inference_on_context_initialization=True
-        )
+        try:
+            gemini_live = GeminiLiveLLMService(
+                api_key=api_key,
+                model=model,
+                voice_id=voice_id,
+                system_instruction=system_prompt,
+                params=gemini_params,
+                inference_on_context_initialization=True
+            )
+        except Exception as e:
+            logger.error(f"Gemini init failed: {e}")
+            return
 
-        # --- TOOLS ---
+        # Tools
         lead_finalized = {"value": None}
         async def confirm_appointment(params: FunctionCallParams):
             lead_finalized["value"] = "CONFIRMED"
@@ -386,7 +406,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         gemini_live.register_function("update_lead_status_confirmed", confirm_appointment)
         gemini_live.register_function("update_lead_status_cancelled", cancel_appointment)
 
-        # --- PIPELINE ---
+        # Pipeline
         mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ المكالمة الآن."}])
         
         start_strategies = [
@@ -433,9 +453,11 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         async def _on_client_disconnected(_transport, _client):
             call_alive["value"] = False
 
+        # Failsafe: If bot doesn't speak in 4s, force start
         async def failsafe():
             await asyncio.sleep(4.0)
             if call_alive["value"] and _MM.get("last_bot_started_ts") is None:
+                logger.warning("Failsafe triggered")
                 await task.queue_frames([LLMRunFrame()])
         asyncio.create_task(failsafe())
 
