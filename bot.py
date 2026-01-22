@@ -18,16 +18,14 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.frames.frames import AudioRawFrame, InputAudioRawFrame, TranscriptionFrame
 from pipecat.transcriptions.language import Language
-from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy
-# NEW IMPORT FOR VAD INTERRUPTION
-from pipecat.turns.user_turn_strategies import VADUserTurnStartStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy, VADUserTurnStartStrategy
 from services.supabase_service import update_lead_status
 import json
 import time
 
 # --- Performance Monitoring Globals ---
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
-BOT_BUILD_ID = "2026-01-22-jordan-dental-sarah-v1"
+BOT_BUILD_ID = "2026-01-22-jordan-dental-fixed-v3"
 _VAD_MODEL = {"value": None}
 
 class MultimodalPerf(FrameProcessor):
@@ -103,18 +101,15 @@ class MultimodalTranscriptRunTrigger(FrameProcessor):
             try:
                 text = (getattr(frame, "text", None) or "").strip()
                 
-                # --- HALLUCINATION FIREWALL ---
                 if len(text) < 2:
                     await self.push_frame(frame, direction)
                     return
                 
-                # Block known audio hallucinations
                 hallucinations = ["ma si problemi", "ma sì problemi", "si", "ok", "thank you", "bye", "you", "okay", "ألو", "alo"]
                 if text.lower() in hallucinations:
                     logger.warning(f"Ignored hallucination: '{text}'")
                     await self.push_frame(frame, direction)
                     return
-                # -----------------------------
 
                 if text:
                     logger.debug(f"Multimodal: final user transcript received ({len(text)} chars)")
@@ -352,7 +347,7 @@ class LeadStatusTranscriptFallback(FrameProcessor):
 def normalize_gemini_live_model_name(model: str) -> str:
     model = (model or "").strip()
     if not model:
-        return "models/gemini-2.5-flash-preview-native-audio-dialog"
+        return "models/gemini-2.0-flash-exp"
     if model.startswith("models/"):
         return model
     if "/" in model:
@@ -379,7 +374,7 @@ async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
         pass
 
 async def run_bot(websocket_client, lead_data, call_control_id=None):
-    logger.info(f"Starting JORDAN DENTAL bot for lead: {lead_data.get('id', 'mock-lead-id')}")
+    logger.info(f"Starting JORDAN DENTAL STRICT bot for lead: {lead_data.get('id', 'mock-lead-id')}")
 
     _MM["last_user_transcription_ts"] = None
     _MM["last_bot_started_ts"] = None
@@ -392,11 +387,9 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     except:
         pipeline_sample_rate = 16000
 
-    # --- MOCK DATA FOR DENTAL CLINIC CONTEXT ---
     if 'patient_name' not in lead_data:
         lead_data['patient_name'] = lead_data.get('customer_name', 'يا غالي')
     
-    # "Treatment" examples: "تركيبات زيركون" (Zirconia), "زراعة أسنان" (Implants), "ابتسامة هوليود" (Hollywood Smile)
     if 'treatment' not in lead_data:
         lead_data['treatment'] = lead_data.get('order_items', 'استشارة زراعة أسنان')
     
@@ -445,11 +438,13 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     vad = None
     cached_vad = _VAD_MODEL.get("value")
     if cached_vad is None:
-        vad = SileroVADAnalyzer(params=VADParams(min_volume=vad_min_volume, start_secs=vad_start_secs, stop_secs=vad_stop_secs, confidence=vad_confidence))
+        # BUG FIX: Ensure sample_rate is passed in initialization
+        vad = SileroVADAnalyzer(params=VADParams(min_volume=vad_min_volume, start_secs=vad_start_secs, stop_secs=vad_stop_secs, confidence=vad_confidence, sample_rate=pipeline_sample_rate))
         _VAD_MODEL["value"] = vad
     else:
         vad = cached_vad
-        vad.set_params(VADParams(min_volume=vad_min_volume, start_secs=vad_start_secs, stop_secs=vad_stop_secs, confidence=vad_confidence))
+        # BUG FIX: Ensure sample_rate is passed in set_params to prevent ZeroDivisionError
+        vad.set_params(VADParams(min_volume=vad_min_volume, start_secs=vad_start_secs, stop_secs=vad_stop_secs, confidence=vad_confidence, sample_rate=pipeline_sample_rate))
 
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
@@ -473,57 +468,48 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             audio_out_sample_rate=pipeline_sample_rate,
         ),
     )
+
+    # -------------------------------------------------------------------------------------
+    # UPDATED SYSTEM PROMPT: STRICT JORDANIAN + NAME DICTIONARY
+    # -------------------------------------------------------------------------------------
     
-    # -------------------------------------------------------------------------------------
-    # SYSTEM PROMPT: JORDANIAN PROFESSIONAL DENTAL TREATMENT COORDINATOR
-    # -------------------------------------------------------------------------------------
+    # 1. Clean data variables
+    p_name = lead_data.get('patient_name', '')
+    
     system_prompt = f"""
-    **IDENTITY:**
-    - Name: Sarah.
-    - Role: Medical Coordinator at "Amman Elite Dental" (عيادة عمان للنخبة).
-    - Accent: **Strict Jordanian Ammani (لهجة عمانية قحة)**.
-    
-    **CRITICAL RULES FOR NUMBERS (ZERO TOLERANCE):**
-    - **NEVER** output digits like "11:00" or "5". The text-to-speech will read them in English.
-    - **ALWAYS** write numbers as ARABIC WORDS.
-      - Don't write "11". Write: **"إحدى عشر"** or **"حداش"**.
-      - Don't write "Saturday". Write: **"يوم السبت"**.
-      - Don't say "Okay". Say: **"تمام"** or **"ماشي"**.
+    **ROLE & IDENTITY:**
+    - Name: Sarah (سارة).
+    - Job: Coordinator at "Amman Elite Dental" (عيادة عمان للنخبة).
+    - Dialect: **Strict Jordanian Ammani (لهجة عمانية بيضاء)**.
+    - Style: Professional but warm.
 
-    **JORDANIAN DIALECT DICTIONARY (USE THESE WORDS):**
-    - Yes -> "آه" or "نعم".
-    - No -> "لأ".
-    - 11:00 -> "الساعة حداش الصبح".
-    - Now -> "هلأ" or "هسا".
-    - Why -> "ليش".
-    - Good -> "تمام" or "منيح".
-    - I want -> "بدي".
-    - Please -> "لو سمحت".
+    **PRONUNCIATION DICTIONARY (STRICT TASHKEEL):**
+    If the patient name appears in this list, you MUST pronounce it exactly as written here:
+    - Oday -> "عُدَيّ"
+    - Hijazi -> "حِجَازِي"
+    - Qusai -> "قُصَيّ"
+    - {p_name} -> "أستاذ {p_name}" (If not in list above).
 
-    **CONVERSATION SCRIPT:**
+    **CRITICAL RULES (DO NOT BREAK):**
+    1. **NO DIGITS:** NEVER write numbers like "11:00" or "5". The system will read them in English.
+       - WRITE: "الساعة حداش" (11:00).
+       - WRITE: "الساعة ثنتين" (2:00).
+       - WRITE: "خمس دقايق" (5 mins).
+    2. **STRICT DIALECT WORDS:**
+       - Use "هسا" or "هلأ" (Now).
+       - Use "عشان" (Because/For).
+       - Use "منيح" or "تمام" (Good).
+       - Use "إلك" (For you).
+    3. **NO ROBOTIC FILLERS:** Do not say "أهلاً بك" or "حسناً". Say "هلا فيك" or "أهلاً".
 
-    1. **Greeting (Warm & Slow):**
-       "ألو.. مسا الخير.. معك سارة من عيادة عمان للنخبة.. بكلم {patient_name_raw}؟"
-    
-    2. **Reason (Direct):**
-       "أهلا فيك.. حبيت أرتب معك موعد عشان الدكاترة فاتحين كشفيات مجانية هالأسبوع بخصوص ({treatment_context}).. شو رأيك تيجي تفحص؟"
+    **CONVERSATION GOAL:**
+    - Greeting: "مسا الخير.. بكلم {p_name}؟ معك سارة من عيادة عمان للنخبة."
+    - Offer: "حبيت أخبرك الدكاترة فتحوا كشفيات مجانية هالأسبوع عشان ({lead_data['treatment']}).. شو رأيك نحجزلك موعد؟"
+    - If user agrees: "تمام، بناسبك السبت الساعة حداش الصبح؟" (Remember: Write 'حداش').
 
-    3. **Timing (Force Arabic Numbers):**
-       If they ask when: "عنا مواعيد يوم السبت الساعة حداش الصبح (11:00 AM) أو الساعة ثنتين الظهر.. شو بيناسبك؟" 
-       *(Note to AI: Write "حداش" strictly).*
-
-    4. **Handling Names:**
-       If the user name is clear, say "أستاذ {patient_name_raw}". If you are unsure how to pronounce it, just say "يا غالي" or "يا قمر" (if female).
-
-    **BEHAVIOR:**
-    - Be succinct.
-    - If user says "مش فاضي" (Busy), say: "ولا يهمك، بس دقيقة وحدة أشرحلك العرض".
-    - If user says "كم السعر" (Price), say: "الكشفية مجانية، والدكتور هو اللي بحدد التكلفة بعد الصورة".
-
-    **OUTPUT FORMAT:**
-    - Do not use Emojis.
-    - Do not use English characters unless absolutely necessary.
-    - Keep responses under 20 words.
+    **OBJECTIONS:**
+    - If "Busy": "حقك علي، بس دقيقة وحدة أشرحلك."
+    - If "Price": "الكشفية مجانية، والدكتور بحدد التكلفة بعد الصورة."
     """
 
     if use_multimodal_live:
@@ -531,10 +517,11 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         if not api_key: return
 
         gemini_in_sample_rate = pipeline_sample_rate
-        model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
+        # Use Experimental Flash for best Arabic
+        model_env = "models/gemini-2.0-flash-exp"
         model = normalize_gemini_live_model_name(model_env)
         
-        # Use "Aoede" (Female, Deep/Professional) for Sarah.
+        # Voice Selection: Aoede (Deep/Pro) or Kore (Clearer)
         voice_id = "Aoede" 
 
         from pipecat.services.google.gemini_live.llm import (
@@ -555,7 +542,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         except:
             GeminiModalities = None
 
-        gemini_params = GeminiLiveInputParams(temperature=0.6) # Slightly lower temp for professional consistency
+        # Temp 0.6 is good balance for dialect adherence
+        gemini_params = GeminiLiveInputParams(temperature=0.6)
         try:
             gemini_params.sample_rate = gemini_in_sample_rate
             if GeminiModalities is not None:
@@ -563,7 +551,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         except:
             pass
 
-        logger.info(f"GeminiLive Jordanian: model={model}, voice={voice_id}")
+        logger.info(f"GeminiLive JORDANIAN FIXED: model={model}, voice={voice_id}")
 
         try:
             gemini_kwargs = {
@@ -592,7 +580,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
 
         async def cancel_appointment(params: FunctionCallParams):
-            logger.info(f"Tool: Patient Cancelled/Not Interested {lead_data['id']}")
+            logger.info(f"Tool: Patient Cancelled {lead_data['id']}")
             lead_finalized["value"] = "CANCELLED"
             update_lead_status(lead_data["id"], "CANCELLED")
             await params.result_callback({"value": "تم إلغاء الموعد"})
@@ -603,7 +591,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         gemini_live.register_function("update_lead_status_cancelled", cancel_appointment)
 
         mm_perf = MultimodalPerf()
-        mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ المكالمة وقدم نفسك بصفتك سارة منسقة العيادة."}])
+        mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ المكالمة الآن."}])
 
         user_mute_strategies = []
         mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
@@ -698,4 +686,3 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
-
