@@ -520,7 +520,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
-
     # OPTIMIZED SAUDI SYSTEM PROMPT
     system_prompt = """أنت "أحمد"، مندوب مبيعات متخصص من "موصول" (Mawsool - mawsool.tech). لهجتك سعودية نجدية طبيعية ومباشرة.
 
@@ -576,6 +575,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             GeminiLiveLLMService as GeminiLiveService,
             InputParams as GeminiLiveInputParams,
         )
+
 
 
         http_api_version = (os.getenv("GEMINI_LIVE_HTTP_API_VERSION") or "v1beta").strip()
@@ -746,6 +746,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
