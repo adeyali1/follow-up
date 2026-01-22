@@ -22,7 +22,7 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TranscriptionUserTurnStartStrategy, TranscriptionUserTurnStopStrategy, VADUserTurnStartStrategy
 
-# --- GOOGLE GEMINI IMPORTS (MOVED TO TOP TO FIX NAME_ERROR) ---
+# --- GOOGLE GEMINI IMPORTS ---
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, InputParams
 
 # --- SERVICE IMPORTS ---
@@ -30,7 +30,7 @@ from services.supabase_service import update_lead_status
 
 # --- PERFORMANCE GLOBALS ---
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
-BOT_BUILD_ID = "2026-01-22-jordan-elite-v8-import-fix"
+BOT_BUILD_ID = "2026-01-22-jordan-elite-v9-vad-fix"
 
 # --- HELPER CLASSES ---
 class MultimodalPerf(FrameProcessor):
@@ -258,12 +258,13 @@ def normalize_gemini_live_model_name(model: str) -> str:
 async def run_bot(websocket_client, lead_data, call_control_id=None):
     logger.info(f"Starting JORDAN ELITE PRO BOT for: {lead_data.get('id', 'mock')}")
 
-    # 1. Prepare Data
-    raw_name = lead_data.get('patient_name', 'يا غالي')
+    # 1. FIX: Better Data Prep (Look for customer_name if patient_name is missing)
+    raw_name = lead_data.get('patient_name') or lead_data.get('customer_name') or 'يا غالي'
     patient_name_ar = get_arabic_name(raw_name) 
     
-    treatment_context = lead_data.get('treatment', 'استشارة أسنان')
-    if "Burger" in treatment_context: treatment_context = "تركيبات الزيركون" # Fix weird mock data
+    treatment_context = lead_data.get('treatment') or lead_data.get('order_items') or 'استشارة أسنان'
+    # Fix the mock data "Burger Meal" issue
+    if "Burger" in treatment_context: treatment_context = "تركيبات الزيركون" 
 
     # 2. Sample Rate Failsafe
     try:
@@ -292,12 +293,14 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     except Exception as e:
         logger.error(f"Stream capture error: {e}")
 
-    # 4. VAD Setup (Fresh Instance - No Global Cache)
+    # 4. VAD Setup (TUNED TO BE LESS SENSITIVE)
+    # Changed start_secs to 0.5 (was 0.1) to avoid interrupting self on line noise
+    # Changed min_volume to 0.3 (was 0.1) to ignore faint static
     vad = SileroVADAnalyzer(params=VADParams(
-        min_volume=0.1, 
-        start_secs=0.1, 
-        stop_secs=0.5, 
-        confidence=0.5, 
+        min_volume=0.3, 
+        start_secs=0.5, 
+        stop_secs=0.8, 
+        confidence=0.6, 
         sample_rate=pipeline_sample_rate
     ))
 
@@ -413,7 +416,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             VADUserTurnStartStrategy(vad_analyzer=vad),
             TranscriptionUserTurnStartStrategy(use_interim=True)
         ]
-        stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=0.6)]
+        stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=0.8)]
 
         mm_aggregators = LLMContextAggregatorPair(
             mm_context,
