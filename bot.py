@@ -494,7 +494,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     else:
         vad = cached_vad
 
-serializer = TelnyxFrameSerializer(
+    serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
         call_control_id=call_control_id,
         api_key=os.getenv("TELNYX_API_KEY"),
@@ -743,9 +743,3 @@ serializer = TelnyxFrameSerializer(
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
-
-
-
-
-
-
