@@ -691,7 +691,6 @@ if use_multimodal_live:
         min_interval_s=float(os.getenv("MULTIMODAL_RUN_MIN_INTERVAL_S") or 0.2),
     )
 
-
         pipeline = Pipeline(
             [
                 transport.input(),
@@ -746,6 +745,7 @@ if use_multimodal_live:
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
