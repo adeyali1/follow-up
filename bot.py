@@ -480,12 +480,13 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     patient_name = normalize_customer_name_for_ar(lead_data.get("patient_name", ""))
 
-    # --- VAD OPTIMIZATION OVERRIDES ---
-    # We enforce these values for responsiveness, ignoring slow env variables
-    vad_stop_secs = 0.5   # Fast turn-taking (User finished speaking)
-    vad_start_secs = 0.2  # Fast wake-up (User started speaking)
-    vad_min_volume = 0.3  # Sensitive enough for normal talking
-    vad_confidence = 0.6  # Balanced confidence
+    # --- CRITICAL FIX: SENSITIVE VAD SETTINGS ---
+    # Log showed min_volume=0.3. This is too high (deaf).
+    # We lower it to 0.1 so it hears phone audio clearly.
+    vad_stop_secs = 0.5   
+    vad_start_secs = 0.1  # FASTER reaction time
+    vad_min_volume = 0.1  # MORE SENSITIVE (was 0.5/0.3)
+    vad_confidence = 0.5  # EASIER to trigger
 
     vad = None
     cached_vad = _VAD_MODEL.get("value")
@@ -500,7 +501,14 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         )
         _VAD_MODEL["value"] = vad
     else:
+        # Force update parameters on the cached model
         vad = cached_vad
+        vad.set_params(VADParams(
+            min_volume=vad_min_volume,
+            start_secs=vad_start_secs,
+            stop_secs=vad_stop_secs,
+            confidence=vad_confidence
+        ))
 
     serializer = TelnyxFrameSerializer(
         stream_id=stream_id,
@@ -524,9 +532,9 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             audio_out_sample_rate=pipeline_sample_rate,
         ),
     )
-    
-    
-    # OPTIMIZED SAUDI (NAJDI) SYSTEM PROMPT V3
+
+    # ... [Keep your System Prompt Here] ...
+    # (Paste the NEW optimized system prompt I gave you earlier here)
     system_prompt = """
     **ROLE & IDENTITY:**
     - Name: Khaled (خالد).
@@ -575,7 +583,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             GeminiLiveLLMService as GeminiLiveService,
             InputParams as GeminiLiveInputParams,
         )
-
+        # --- NEW IMPORT FOR VAD INTERRUPTION ---
+        from pipecat.turns.user_turn_strategies import VADUserTurnStartStrategy
 
         http_api_version = (os.getenv("GEMINI_LIVE_HTTP_API_VERSION") or "v1beta").strip()
         http_options = None
@@ -591,8 +600,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         except Exception:
             GeminiModalities = None
 
-        # OPTIMIZED GEMINI PARAMS
-        # Temperature 0.7 gives more "Natural" Saudi flavor than 0.5
         gemini_params = GeminiLiveInputParams(temperature=0.7)
 
         try:
@@ -656,9 +663,15 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             except Exception:
                 pass
 
-        # Strategies using the Hardcoded VAD values
         stop_timeout_s = 0.6 
-        start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
+        
+        # --- CRITICAL FIX: STRATEGIES ---
+        # 1. Added VADUserTurnStartStrategy -> Triggers on SOUND (Instant)
+        # 2. Kept TranscriptionUserTurnStartStrategy -> Triggers on WORDS (Backup)
+        start_strategies = [
+            VADUserTurnStartStrategy(vad_analyzer=vad),
+            TranscriptionUserTurnStartStrategy(use_interim=True)
+        ]
         stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=stop_timeout_s)]
 
         mm_aggregators = LLMContextAggregatorPair(
@@ -676,7 +689,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         except Exception:
             pass
 
-        # Optimized trigger delays for faster responses
         transcript_run_delay_s = 0.5 
         transcript_trigger = MultimodalTranscriptRunTrigger(delay_s=transcript_run_delay_s)
 
@@ -703,7 +715,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 transcript_fallback,
                 TurnStateLogger(),
                 OutboundAudioLogger(),
-                # We default to 20ms chunking for smoother audio, overriding the 100ms in Env if simpler logic was used
                 AudioFrameChunker(chunk_ms=int(os.getenv("AUDIO_OUT_CHUNK_MS") or 20)),
                 mm_perf,
                 transport.output(),
@@ -747,5 +758,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
