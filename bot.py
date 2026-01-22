@@ -503,7 +503,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         params=TelnyxFrameSerializer.InputParams(sample_rate=pipeline_sample_rate),
     )
 
-        transport = FastAPIWebsocketTransport(
+          transport = FastAPIWebsocketTransport(
         websocket=websocket_client,
         params=FastAPIWebsocketParams(
             serializer=serializer,
@@ -516,6 +516,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             audio_out_sample_rate=pipeline_sample_rate,
         ),
     )
+
 
     # OPTIMIZED SAUDI SYSTEM PROMPT
     system_prompt = """أنت "أحمد"، مندوب مبيعات متخصص من "موصول" (Mawsool - mawsool.tech). لهجتك سعودية نجدية طبيعية ومباشرة.
@@ -741,6 +742,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
