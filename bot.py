@@ -589,10 +589,8 @@ if use_multimodal_live:
         GeminiModalities = None
 
     # Optimized temperature for more consistent, focused responses
-    gemini_params = GeminiLiveInputParams(
-        temperature=0.7,  # يعطي حياة
-        top_p=0.9         # يخفف الجمود
-    )
+          gemini_params = GeminiLiveInputParams(temperature=0.3)
+
 
     try:
         gemini_params.sample_rate = gemini_in_sample_rate
@@ -745,6 +743,7 @@ if use_multimodal_live:
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
