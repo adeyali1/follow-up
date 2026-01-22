@@ -588,18 +588,18 @@ if use_multimodal_live:
     except Exception:
         GeminiModalities = None
 
-    # Optimized temperature for more consistent, focused responses
+# Optimized temperature for more consistent, focused responses
     gemini_params = GeminiLiveInputParams(
         temperature=0.7,  # يعطي حياة
         top_p=0.9         # يخفف الجمود
     )
 
-        try:
-            gemini_params.sample_rate = gemini_in_sample_rate
-            if GeminiModalities is not None:
-                gemini_params.modalities = GeminiModalities.AUDIO
-        except Exception:
-            pass
+    try:
+        gemini_params.sample_rate = gemini_in_sample_rate
+        if GeminiModalities is not None:
+            gemini_params.modalities = GeminiModalities.AUDIO
+    except Exception:
+        pass
 
         logger.info(f"GeminiLive Optimized: model={model}, voice={voice_id}, temp=0.5")
 
@@ -745,6 +745,7 @@ if use_multimodal_live:
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
