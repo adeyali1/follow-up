@@ -558,7 +558,7 @@ system_prompt = """أنت "أحمد"، مندوب مبيعات متخصص من "
 
 
 **تذكر:** خليك مختصر، طبيعي، وواضح. كل جملة زيادة تقلل فرصة الإقناع."""
-
+"""
     if use_multimodal_live:
         api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         if not api_key:
@@ -743,5 +743,6 @@ system_prompt = """أنت "أحمد"، مندوب مبيعات متخصص من "
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
