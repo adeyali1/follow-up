@@ -25,7 +25,7 @@ import time
 
 # --- Performance Monitoring Globals ---
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
-BOT_BUILD_ID = "2026-01-22-jordan-human-v5-final"
+BOT_BUILD_ID = "2026-01-22-jordan-elite-pro-v6"
 _VAD_MODEL = {"value": None}
 
 class MultimodalPerf(FrameProcessor):
@@ -233,12 +233,8 @@ async def hangup_telnyx_call(call_control_id: str, delay_s: float) -> None:
 def normalize_gemini_live_model_name(model: str) -> str:
     return model if "models/" in model else f"models/{model}"
 
-# --- THE FIX: PYTHON-SIDE NAME MAPPER ---
+# --- HELPER: NAME MAPPER (Prevents American Accent) ---
 def get_arabic_name(english_name: str) -> str:
-    """
-    Converts known English mock names to Arabic Script.
-    This prevents the AI from reading them in an English Accent.
-    """
     name_map = {
         "oday": "عُدَيّ",
         "qusai": "قُصَيّ",
@@ -247,28 +243,27 @@ def get_arabic_name(english_name: str) -> str:
         "mohammad": "محمد",
         "khaled": "خالد",
         "sarah": "سارة",
-        "yousef": "يوسف"
+        "yousef": "يوسف",
+        "mahmoud": "محمود"
     }
     cleaned = english_name.strip().lower()
-    return name_map.get(cleaned, english_name) # Returns Arabic if found, else original
+    return name_map.get(cleaned, english_name) 
 
 async def run_bot(websocket_client, lead_data, call_control_id=None):
-    logger.info(f"Starting JORDAN HUMANIZED BOT for: {lead_data.get('id', 'mock')}")
+    logger.info(f"Starting JORDAN PRO BOT for: {lead_data.get('id', 'mock')}")
 
-    # --- 1. PRE-PROCESS DATA ---
+    # --- 1. DATA PREP ---
     raw_name = lead_data.get('patient_name', 'يا غالي')
-    # Force conversion to Arabic Script
     patient_name_ar = get_arabic_name(raw_name) 
     
     treatment_context = lead_data.get('treatment', 'استشارة أسنان')
-    if "Burger" in treatment_context: # Fix the mock data weirdness from logs
+    if "Burger" in treatment_context: 
         treatment_context = "تركيبات الزيركون"
 
     pipeline_sample_rate = 16000
     stream_id = "telnyx_stream_placeholder"
     inbound_encoding = "PCMU"
     
-    # Capture Stream ID (standard logic)
     try:
         for _ in range(3):
             msg_text = await websocket_client.receive_text()
@@ -284,7 +279,8 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
                 break
     except: pass
 
-    # --- 2. VAD SETTINGS (Keep the fixes) ---
+    # --- 2. VAD SETTINGS ---
+    # 0.1s start triggers interruption instantly when user speaks.
     vad = SileroVADAnalyzer(params=VADParams(min_volume=0.1, start_secs=0.1, stop_secs=0.5, confidence=0.5, sample_rate=pipeline_sample_rate))
     _VAD_MODEL["value"] = vad
 
@@ -312,33 +308,42 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     )
 
     # ---------------------------------------------------------------------
-    # SYSTEM PROMPT: THE "CASUAL LOCAL" UPDATE
+    # SYSTEM PROMPT: PROFESSIONAL ELITE CLINIC
     # ---------------------------------------------------------------------
     system_prompt = f"""
-    **IDENTITY:**
-    You are Sarah (سارة), a friendly receptionist at "Amman Elite Dental".
-    
-    **TONE (CASUAL & NATURAL):**
-    - Speak **Jordanian Ammani (لهجة بيضاء)**.
-    - Be **CASUAL**. Do not sound like a robot reading a script.
-    - If the user says "Min Mai?" (Who is this?), laugh gently and say: "معك سارة من العيادة، نسيتنا؟" (It's Sarah from the clinic, forgot us?).
-    - Use fillers: "يعني", "طيب", "شوف".
+    **ROLE & PERSONA:**
+    - Name: Sarah (سارة).
+    - Position: Treatment Coordinator at **Amman Elite Dental** (عيادة عمان للنخبة).
+    - Dialect: **Professional Jordanian Ammani** (لهجة بيضاء راقية).
+    - Tone: Confident, Warm, Efficient. NOT robotic, NOT overly casual.
 
-    **VOCABULARY RULES (STRICT):**
-    1. **Numbers:** WRITE WORDS ONLY. "حداش" (11), "ثنتين" (2).
-    2. **Name:** Call the patient "{patient_name_ar}". NEVER pronounce it in English.
-    3. **Confirmation:** Say "تمام" or "اتفقنا".
-    
-    **CONVERSATION GUIDE:**
-    1. **The Opening (Ping):**
-       "ألو.. مسا الخير.. {patient_name_ar} معي؟"
-       *(Wait for them to answer "Yes" or "Who is this?")*
-    
-    2. **The Reason:**
-       "يا هلا.. حبيت أخبرك دكاترتنا فتحوا كشفيات مجانية هالأسبوع لـ ({treatment_context}).. قلت برن عليك تستفيد من العرض، شو رأيك؟"
-    
-    3. **The Close:**
-       "عنا موعد السبت الساعة حداش.. أحجزلك ياه؟"
+    **CRITICAL VOCABULARY RULES (NEVER BREAK THESE):**
+    1.  **Numbers:** You must **NEVER** write digits (1, 2, 3). ALWAYS write words:
+        -   Write "حداش" for 11.
+        -   Write "ثنتين" for 2.
+    2.  **Addressing Patient:** Use "أستاذ {patient_name_ar}" (Ustaz). If female, use "آنسة" (Miss).
+    3.  **Confirmations:** Use "تمام" (Tamam), "أكيد" (Akid), "ولا يهمك" (Wala Yhemmak).
+
+    **CONVERSATION STRUCTURE:**
+
+    1.  **The Professional Greeting:**
+        "ألو.. مسا الخير.. مع حضرتك سارة من عيادة عمان للنخبة.. بكلم الأستاذ {patient_name_ar}؟"
+
+    2.  **The Value Proposition (Clear & Concise):**
+        "يا هلا فيك أستاذ.. بصراحة حبيت أتواصل معك شخصياً لأن الدكاترة عنا فتحوا (كشفيات مجانية) هالأسبوع بخصوص ({treatment_context}).. وحبيت تستفيد من الفرصة، شو رأيك؟"
+
+    3.  **Handling Objections (Diplomatic):**
+        -   *Busy:* "أنا مقدرة وقتك، بس دقيقة أشرحلك العرض وما رح أطول."
+        -   *Price:* "طبعاً الكشفية مجانية بالكامل، والدكتور بيعطيك الخطة العلاجية والتكلفة بعد الفحص."
+        -   *Not Interested:* "ولا يهمك أستاذ، تشرفنا فيك. مع السلامة."
+
+    4.  **The Closing (Specific):**
+        "عنا موعد متاح يوم السبت الساعة حداش الصبح.. بناسبك نحجزلك إياه؟"
+
+    **BEHAVIORAL GUIDELINES:**
+    -   If the user interrupts, STOP speaking immediately.
+    -   If the user asks "Who is this?" again, say: "معك سارة، منسقة العلاج بعيادة عمان."
+    -   Do not give medical advice. Say: "الدكتور هو اللي بيحدد هالتفاصيل بالعيادة."
     """
 
     use_multimodal_live = os.getenv("USE_MULTIMODAL_LIVE", "true").lower() == "true"
@@ -346,13 +351,13 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key: return
 
-        # VOICE: Kore is often clearer and softer than Aoede
+        # VOICE: "Kore" is the best balance of clear articulation and human tone for Arabic.
         voice_id = "Kore" 
         model = "models/gemini-2.0-flash-exp"
 
         from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, InputParams
         
-        # Temp 0.6 keeps the dialect consistent but allows some "casual" improvisation
+        # Temp 0.6 prevents "Fusha" drift while keeping conversation dynamic
         gemini_params = InputParams(temperature=0.6) 
 
         gemini_live = GeminiLiveService(
@@ -369,13 +374,13 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         async def confirm_appointment(params: FunctionCallParams):
             lead_finalized["value"] = "CONFIRMED"
             update_lead_status(lead_data["id"], "CONFIRMED")
-            await params.result_callback({"value": "done"})
+            await params.result_callback({"value": "تم الحجز"})
             if call_control_id: asyncio.create_task(hangup_telnyx_call(call_control_id, 2.0))
 
         async def cancel_appointment(params: FunctionCallParams):
             lead_finalized["value"] = "CANCELLED"
             update_lead_status(lead_data["id"], "CANCELLED")
-            await params.result_callback({"value": "done"})
+            await params.result_callback({"value": "تم الإلغاء"})
             if call_control_id: asyncio.create_task(hangup_telnyx_call(call_control_id, 2.0))
 
         gemini_live.register_function("update_lead_status_confirmed", confirm_appointment)
@@ -384,12 +389,10 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         # --- PIPELINE ---
         mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ المكالمة الآن."}])
         
-        # Strategies
         start_strategies = [
             VADUserTurnStartStrategy(vad_analyzer=vad),
             TranscriptionUserTurnStartStrategy(use_interim=True)
         ]
-        # Fast stop for interruptions
         stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=0.6)]
 
         mm_aggregators = LLMContextAggregatorPair(
@@ -406,7 +409,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             transport.input(),
             InboundAudioLogger(),
             mm_aggregators.user(),
-            MultimodalUserStopRunTrigger(), # Fast trigger
+            MultimodalUserStopRunTrigger(),
             gemini_live,
             MultimodalTranscriptRunTrigger(delay_s=0.5),
             LeadStatusTranscriptFallback(lead_id=lead_data["id"], call_control_id=call_control_id, call_end_delay_s=2.0, finalized_ref=lead_finalized),
@@ -430,7 +433,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         async def _on_client_disconnected(_transport, _client):
             call_alive["value"] = False
 
-        # Failsafe start
         async def failsafe():
             await asyncio.sleep(4.0)
             if call_alive["value"] and _MM.get("last_bot_started_ts") is None:
