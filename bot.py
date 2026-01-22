@@ -558,42 +558,41 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 **تذكر:** خليك مختصر، طبيعي، وواضح.
 """
 
-    if use_multimodal_live:
-        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            logger.error("GOOGLE_API_KEY/GEMINI_API_KEY is missing.")
-            return
+if use_multimodal_live:
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.error("GOOGLE_API_KEY/GEMINI_API_KEY is missing.")
+        return
 
-        gemini_in_sample_rate = pipeline_sample_rate
-        model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
-        model = normalize_gemini_live_model_name(model_env)
-        voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Aoede").strip()
+    gemini_in_sample_rate = pipeline_sample_rate
+    model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
+    model = normalize_gemini_live_model_name(model_env)
+    voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Aoede").strip()
 
-        from pipecat.services.google.gemini_live.llm import (
-            GeminiLiveLLMService as GeminiLiveService,
-            InputParams as GeminiLiveInputParams,
-        )
+    from pipecat.services.google.gemini_live.llm import (
+        GeminiLiveLLMService as GeminiLiveService,
+        InputParams as GeminiLiveInputParams,
+    )
 
+    http_api_version = (os.getenv("GEMINI_LIVE_HTTP_API_VERSION") or "v1beta").strip()
+    http_options = None
 
-        http_api_version = (os.getenv("GEMINI_LIVE_HTTP_API_VERSION") or "v1beta").strip()
-        http_options = None
+    try:
+        from google.genai.types import HttpOptions
+        http_options = HttpOptions(api_version=http_api_version)
+    except Exception:
+        pass
 
-        try:
-            from google.genai.types import HttpOptions
-            http_options = HttpOptions(api_version=http_api_version)
-        except Exception:
-            pass
+    try:
+        from pipecat.services.google.gemini_live.llm import GeminiModalities
+    except Exception:
+        GeminiModalities = None
 
-        try:
-            from pipecat.services.google.gemini_live.llm import GeminiModalities
-        except Exception:
-            GeminiModalities = None
-
- # Optimized temperature for more consistent, focused responses
-gemini_params = GeminiLiveInputParams(
-    temperature=0.7,      # يعطي حياة
-    top_p=0.9             # يخفف الجمود
-)
+    # Optimized temperature for more consistent, focused responses
+    gemini_params = GeminiLiveInputParams(
+        temperature=0.7,  # يعطي حياة
+        top_p=0.9         # يخفف الجمود
+    )
 
 
 
@@ -748,6 +747,7 @@ gemini_params = GeminiLiveInputParams(
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
