@@ -1,6 +1,3 @@
-hers my code it was workingonly when i change te ptomt and dded vad in the env after that the error accord
-
-
 import os
 import asyncio
 import aiohttp
@@ -744,6 +741,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
