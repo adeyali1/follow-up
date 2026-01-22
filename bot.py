@@ -594,8 +594,6 @@ if use_multimodal_live:
         top_p=0.9         # يخفف الجمود
     )
 
-
-
         try:
             gemini_params.sample_rate = gemini_in_sample_rate
             if GeminiModalities is not None:
@@ -747,6 +745,7 @@ if use_multimodal_live:
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
