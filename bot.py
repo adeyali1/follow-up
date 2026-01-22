@@ -589,11 +589,12 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         except Exception:
             GeminiModalities = None
 
-        # Optimized temperature for more consistent, focused responses
-        GeminiLiveInputParams(
+ # Optimized temperature for more consistent, focused responses
+gemini_params = GeminiLiveInputParams(
     temperature=0.7,      # يعطي حياة
     top_p=0.9             # يخفف الجمود
 )
+
 
 
         try:
@@ -747,6 +748,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
 
 
 
