@@ -589,104 +589,107 @@ if use_multimodal_live:
         GeminiModalities = None
 
     # Optimized temperature for more consistent, focused responses
-GeminiLiveInputParams( temperature=0.7,top_p=0.9) 
+    gemini_params = GeminiLiveInputParams(
+        temperature=0.7,  # يعطي حياة
+        top_p=0.9         # يخفف الجمود
+    )
 
-    try:
-        gemini_params.sample_rate = gemini_in_sample_rate
-        if GeminiModalities is not None:
-            gemini_params.modalities = GeminiModalities.AUDIO
-    except Exception:
-        pass
-
-    logger.info(f"GeminiLive Optimized: model={model}, voice={voice_id}, temp=0.5")
-
-    try:
-        gemini_kwargs = {
-            "api_key": api_key,
-            "voice_id": voice_id,
-            "system_instruction": system_prompt,
-            "params": gemini_params,
-            "inference_on_context_initialization": True,
-        }
-        if http_options is not None:
-            gemini_kwargs["http_options"] = http_options
-        if model:
-            gemini_kwargs["model"] = model
-
-        gemini_live = GeminiLiveService(**gemini_kwargs)
-    except Exception as e:
-        logger.error(f"GeminiLive init failed: {e}")
-        return
-
-    call_end_delay_s = 2.0  # Slightly reduced for faster call termination
-    lead_finalized = {"value": None}
-
-    async def confirm_appointment(params: FunctionCallParams):
-        logger.info(f"Tool: Confirming Demo/Appointment for {lead_data['id']}")
-        lead_finalized["value"] = "CONFIRMED"
-        update_lead_status(lead_data["id"], "CONFIRMED")
-        await params.result_callback({"value": "تم تأكيد الموعد بنجاح"})
-        if call_control_id:
-            asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
-
-    async def cancel_appointment(params: FunctionCallParams):
-        logger.info(f"Tool: Cancelling for {lead_data['id']}")
-        lead_finalized["value"] = "CANCELLED"
-        update_lead_status(lead_data["id"], "CANCELLED")
-        await params.result_callback({"value": "تم إلغاء الموعد"})
-        if call_control_id:
-            asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
-
-    gemini_live.register_function("update_lead_status_confirmed", confirm_appointment)
-    gemini_live.register_function("update_lead_status_cancelled", cancel_appointment)
-
-    mm_perf = MultimodalPerf()
-    mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ المكالمة وقدم نفسك بشكل مختصر ومباشر."}])
-
-    user_mute_strategies = []
-    mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
-    if mute_first_bot:
         try:
-            from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
-            user_mute_strategies.append(MuteUntilFirstBotCompleteUserMuteStrategy())
+            gemini_params.sample_rate = gemini_in_sample_rate
+            if GeminiModalities is not None:
+                gemini_params.modalities = GeminiModalities.AUDIO
         except Exception:
             pass
 
-    # Optimized for faster response times
-    stop_timeout_s = 0.6  # Reduced from 0.8 for quicker turn detection
-    start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
-    stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=stop_timeout_s)]
+        logger.info(f"GeminiLive Optimized: model={model}, voice={voice_id}, temp=0.5")
 
-    mm_aggregators = LLMContextAggregatorPair(
-        mm_context,
-        user_params=LLMUserAggregatorParams(
-            user_turn_strategies=UserTurnStrategies(start=start_strategies, stop=stop_strategies),
-            user_mute_strategies=user_mute_strategies,
-        ),
-    )
+        try:
+            gemini_kwargs = {
+                "api_key": api_key,
+                "voice_id": voice_id,
+                "system_instruction": system_prompt,
+                "params": gemini_params,
+                "inference_on_context_initialization": True,
+            }
+            if http_options is not None:
+                gemini_kwargs["http_options"] = http_options
+            if model:
+                gemini_kwargs["model"] = model
 
-    try:
-        maybe_coro = gemini_live.set_context(mm_context)
-        if asyncio.iscoroutine(maybe_coro):
-            await maybe_coro
-    except Exception:
-        pass
+            gemini_live = GeminiLiveService(**gemini_kwargs)
+        except Exception as e:
+            logger.error(f"GeminiLive init failed: {e}")
+            return
 
-    # Optimized trigger delays for faster responses
-    transcript_run_delay_s = 0.5  # Reduced from 0.7
-    transcript_trigger = MultimodalTranscriptRunTrigger(delay_s=transcript_run_delay_s)
+        call_end_delay_s = 2.0  # Slightly reduced for faster call termination
+        lead_finalized = {"value": None}
 
-    transcript_fallback = LeadStatusTranscriptFallback(
-        lead_id=lead_data["id"],
-        call_control_id=call_control_id,
-        call_end_delay_s=call_end_delay_s,
-        finalized_ref=lead_finalized,
-    )
+        async def confirm_appointment(params: FunctionCallParams):
+            logger.info(f"Tool: Confirming Demo/Appointment for {lead_data['id']}")
+            lead_finalized["value"] = "CONFIRMED"
+            update_lead_status(lead_data["id"], "CONFIRMED")
+            await params.result_callback({"value": "تم تأكيد الموعد بنجاح"})
+            if call_control_id:
+                asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
 
-    user_stop_trigger = MultimodalUserStopRunTrigger(
-        delay_s=float(os.getenv("MULTIMODAL_RUN_ON_USER_STOP_DELAY_S") or 0.03),
-        min_interval_s=float(os.getenv("MULTIMODAL_RUN_MIN_INTERVAL_S") or 0.2),
-    )
+        async def cancel_appointment(params: FunctionCallParams):
+            logger.info(f"Tool: Cancelling for {lead_data['id']}")
+            lead_finalized["value"] = "CANCELLED"
+            update_lead_status(lead_data["id"], "CANCELLED")
+            await params.result_callback({"value": "تم إلغاء الموعد"})
+            if call_control_id:
+                asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
+
+        gemini_live.register_function("update_lead_status_confirmed", confirm_appointment)
+        gemini_live.register_function("update_lead_status_cancelled", cancel_appointment)
+
+        mm_perf = MultimodalPerf()
+        mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ المكالمة وقدم نفسك بشكل مختصر ومباشر."}])
+
+        user_mute_strategies = []
+        mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
+        if mute_first_bot:
+            try:
+                from pipecat.turns.mute import MuteUntilFirstBotCompleteUserMuteStrategy
+                user_mute_strategies.append(MuteUntilFirstBotCompleteUserMuteStrategy())
+            except Exception:
+                pass
+
+        # Optimized for faster response times
+        stop_timeout_s = 0.6  # Reduced from 0.8 for quicker turn detection
+        start_strategies = [TranscriptionUserTurnStartStrategy(use_interim=True)]
+        stop_strategies = [TranscriptionUserTurnStopStrategy(timeout=stop_timeout_s)]
+
+        mm_aggregators = LLMContextAggregatorPair(
+            mm_context,
+            user_params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(start=start_strategies, stop=stop_strategies),
+                user_mute_strategies=user_mute_strategies,
+            ),
+        )
+
+        try:
+            maybe_coro = gemini_live.set_context(mm_context)
+            if asyncio.iscoroutine(maybe_coro):
+                await maybe_coro
+        except Exception:
+            pass
+
+        # Optimized trigger delays for faster responses
+        transcript_run_delay_s = 0.5  # Reduced from 0.7
+        transcript_trigger = MultimodalTranscriptRunTrigger(delay_s=transcript_run_delay_s)
+
+        transcript_fallback = LeadStatusTranscriptFallback(
+            lead_id=lead_data["id"],
+            call_control_id=call_control_id,
+            call_end_delay_s=call_end_delay_s,
+            finalized_ref=lead_finalized,
+        )
+
+        user_stop_trigger = MultimodalUserStopRunTrigger(
+            delay_s=float(os.getenv("MULTIMODAL_RUN_ON_USER_STOP_DELAY_S") or 0.03),
+            min_interval_s=float(os.getenv("MULTIMODAL_RUN_MIN_INTERVAL_S") or 0.2),
+        )
 
         pipeline = Pipeline(
             [
@@ -742,12 +745,6 @@ GeminiLiveInputParams( temperature=0.7,top_p=0.9)
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
-
-
-
-
-
-
 
 
 
