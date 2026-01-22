@@ -1,3 +1,6 @@
+hers my code it was workingonly when i change te ptomt and dded vad in the env after that the error accord
+
+
 import os
 import asyncio
 import aiohttp
@@ -503,7 +506,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         params=TelnyxFrameSerializer.InputParams(sample_rate=pipeline_sample_rate),
     )
 
-    transport = FastAPIWebsocketTransport(
+        transport = FastAPIWebsocketTransport(
         websocket=websocket_client,
         params=FastAPIWebsocketParams(
             serializer=serializer,
@@ -517,23 +520,23 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
+
     # OPTIMIZED SAUDI SYSTEM PROMPT
-    system_prompt = """أنت "خالد"، مندوب مبيعات متخصص من "موصول" (Mawsool - mawsool.tech). لهجتك سعودية نجدية طبيعية ومباشرة.
+    system_prompt = """أنت "أحمد"، مندوب مبيعات متخصص من "موصول" (Mawsool - mawsool.tech). لهجتك سعودية نجدية طبيعية ومباشرة.
 
 **القواعد الذهبية:**
 1. **اختصر واوضح**: جملة أو جملتين كحد أقصى في كل رد
 2. **استمع أكثر**: إذا قاطعك العميل، اسكت فوراً واسمعه
 3. **كن طبيعي**: استخدم كلمات مثل "هلا"، "تمام"، "أبشر"، "عاد"، "سم"
 4. **لا تكرر**: إذا سألت سؤال، ما تعيده ثاني
-5.كأنك تكلم عميل على الجوال.
 
 **الهدف الوحيد:**
 حجز موعد ديمو لمنصة موصول - قاعدة بيانات ضخمة لبيانات الشركات (B2B Leads).
 
 **طريقة الحوار:**
-1. **الافتتاح** (مرة واحدة فقط): "هلا والله! معك خالد من موصول، عساك طيب؟"
+1. **الافتتاح** (مرة واحدة فقط): "هلا والله! معك أحمد من موصول، عساك طيب؟"
 2. **إذا قال مشغول**: "ما أطول عليك، دقيقة وحدة. تسمح لي؟"
-3. **الشرح المختصر**: "طال عمرك، موصول توفر لك أرقام وإيميلات مدراء الشركات في السعودية والخليج، دقة عالية وتحديث يومي. تغنيك عن 10 أدوات وتوفر عليك آلاف الريالات."
+3. **الشرح المختصر**: "طال عمرك، موصول توفر لك أرقام وإيميلات مدراء الشركات في السعودية والخليج، دقة 98% وتحديث يومي. تغنيك عن 10 أدوات وتوفر عليك آلاف الريالات."
 4. **إغلاق الموعد**: "وش رايك نحجز لك ديمو سريع تشوف فيه النظام؟ متى يناسبك؟"
 
 **الردود** (examples):
@@ -558,45 +561,46 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 **تذكر:** خليك مختصر، طبيعي، وواضح.
 """
 
-if use_multimodal_live:
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        logger.error("GOOGLE_API_KEY/GEMINI_API_KEY is missing.")
-        return
+    if use_multimodal_live:
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            logger.error("GOOGLE_API_KEY/GEMINI_API_KEY is missing.")
+            return
 
-    gemini_in_sample_rate = pipeline_sample_rate
-    model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
-    model = normalize_gemini_live_model_name(model_env)
-    voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Aoede").strip()
+        gemini_in_sample_rate = pipeline_sample_rate
+        model_env = (os.getenv("GEMINI_LIVE_MODEL") or "").strip()
+        model = normalize_gemini_live_model_name(model_env)
+        voice_id = (os.getenv("GEMINI_LIVE_VOICE") or "Aoede").strip()
 
-    from pipecat.services.google.gemini_live.llm import (
-        GeminiLiveLLMService as GeminiLiveService,
-        InputParams as GeminiLiveInputParams,
-    )
+        from pipecat.services.google.gemini_live.llm import (
+            GeminiLiveLLMService as GeminiLiveService,
+            InputParams as GeminiLiveInputParams,
+        )
 
-    http_api_version = (os.getenv("GEMINI_LIVE_HTTP_API_VERSION") or "v1beta").strip()
-    http_options = None
 
-    try:
-        from google.genai.types import HttpOptions
-        http_options = HttpOptions(api_version=http_api_version)
-    except Exception:
-        pass
+        http_api_version = (os.getenv("GEMINI_LIVE_HTTP_API_VERSION") or "v1beta").strip()
+        http_options = None
 
-    try:
-        from pipecat.services.google.gemini_live.llm import GeminiModalities
-    except Exception:
-        GeminiModalities = None
+        try:
+            from google.genai.types import HttpOptions
+            http_options = HttpOptions(api_version=http_api_version)
+        except Exception:
+            pass
 
-# Optimized temperature for more consistent, focused responses
-GeminiLiveInputParams(temperature=0.7)
+        try:
+            from pipecat.services.google.gemini_live.llm import GeminiModalities
+        except Exception:
+            GeminiModalities = None
 
-    try:
-        gemini_params.sample_rate = gemini_in_sample_rate
-        if GeminiModalities is not None:
-            gemini_params.modalities = GeminiModalities.AUDIO
-    except Exception:
-        pass
+        # Optimized temperature for more consistent, focused responses
+        gemini_params = GeminiLiveInputParams(temperature=0.5)
+
+        try:
+            gemini_params.sample_rate = gemini_in_sample_rate
+            if GeminiModalities is not None:
+                gemini_params.modalities = GeminiModalities.AUDIO
+        except Exception:
+            pass
 
         logger.info(f"GeminiLive Optimized: model={model}, voice={voice_id}, temp=0.5")
 
@@ -742,14 +746,6 @@ GeminiLiveInputParams(temperature=0.7)
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
-
-
-
-
-
-
-
-
 
 
 
