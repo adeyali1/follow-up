@@ -25,7 +25,7 @@ import time
 
 # --- Performance Monitoring Globals ---
 _MM = {"last_user_transcription_ts": None, "last_bot_started_ts": None, "last_llm_run_ts": None}
-BOT_BUILD_ID = "2026-01-24-jordan-delivery-khaled-v1"
+BOT_BUILD_ID = "2026-01-22-saudi-ahmed-najdi-v3-optimized"
 _VAD_MODEL = {"value": None}
 
 class MultimodalPerf(FrameProcessor):
@@ -311,7 +311,7 @@ class LeadStatusTranscriptFallback(FrameProcessor):
         t = LeadStatusTranscriptFallback._normalize(text)
         if not t:
             return False
-        if any(x in t for x in ["الغ", "كنسل", "cancel", "مش بد", "مش بدي", "لا بدي", "إلغاء", "الغاء", "بطلت"]):
+        if any(x in t for x in ["الغ", "كنسل", "cancel", "مش بد", "مش بدي", "لا بدي", "إلغاء", "الغاء"]):
             return False
         if "مش" in t and any(x in t for x in ["تمام", "ماشي", "موافق"]):
             return False
@@ -332,8 +332,6 @@ class LeadStatusTranscriptFallback(FrameProcessor):
                 "أه",
                 "صح",
                 "عاد",
-                "اعتمد",
-                "توكل"
             ]
         )
 
@@ -342,7 +340,7 @@ class LeadStatusTranscriptFallback(FrameProcessor):
         t = LeadStatusTranscriptFallback._normalize(text)
         if not t:
             return False
-        return any(x in t for x in ["الغ", "إلغاء", "الغاء", "كنسل", "cancel", "مش بد", "مش بدي", "لا شكر", "بطلت"])
+        return any(x in t for x in ["الغ", "إلغاء", "الغاء", "كنسل", "cancel", "مش بد", "مش بدي", "لا شكر"])
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -435,13 +433,12 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     except Exception:
         pipeline_sample_rate = 16000
 
-    # --- SETUP LEAD DATA FOR DELIVERY CONTEXT ---
-    if 'customer_name' not in lead_data:
-        lead_data['customer_name'] = lead_data.get('name', 'يا غالي')
-    if 'order_items' not in lead_data:
-        lead_data['order_items'] = lead_data.get('items', 'طلبك')
-    if 'delivery_time' not in lead_data:
-        lead_data['delivery_time'] = lead_data.get('time', 'خلال اليوم')
+    if 'patient_name' not in lead_data:
+        lead_data['patient_name'] = lead_data.get('customer_name', 'يا غالي')
+    if 'treatment' not in lead_data:
+        lead_data['treatment'] = lead_data.get('order_items', 'ديمو منصة موصول')
+    if 'appointment_time' not in lead_data:
+        lead_data['appointment_time'] = lead_data.get('delivery_time', 'خلال هالأسبوع')
     if 'id' not in lead_data:
         lead_data['id'] = 'mock-lead-id'
 
@@ -481,11 +478,14 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
     except Exception as e:
         logger.error(f"Failed to capture stream_id: {e}")
 
+    patient_name = normalize_customer_name_for_ar(lead_data.get("patient_name", ""))
+
     # --- CRITICAL FIX: SENSITIVE VAD SETTINGS ---
-    # Optimized for fast interaction
+    # Log showed min_volume=0.3. This is too high (deaf).
+    # We lower it to 0.1 so it hears phone audio clearly.
     vad_stop_secs = 0.5   
     vad_start_secs = 0.1  # FASTER reaction time
-    vad_min_volume = 0.1  # MORE SENSITIVE
+    vad_min_volume = 0.1  # MORE SENSITIVE (was 0.5/0.3)
     vad_confidence = 0.5  # EASIER to trigger
 
     vad = None
@@ -533,25 +533,40 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         ),
     )
 
-    # --- UPDATED SYSTEM PROMPT FOR JORDANIAN DELIVERY ASSISTANT ---
-    system_prompt = f"""أنت \"خالد\" مساعد تأكيد طلبات للتوصيل في الأردن. احكي عامية أردنية طبيعية وبأسلوب ودود.
-خليك مختصر: جُمل قصيرة وما تطوّل.
+    # ... [Keep your System Prompt Here] ...
+    # (Paste the NEW optimized system prompt I gave you earlier here)
+    system_prompt = """
+    **ROLE & IDENTITY:**
+    - Name: Khaled (خالد).
+    - Position: Relationship Manager at "Mawsool" (موصول).
+    - Dialect: **Saudi Najdi (Riyadh) only**. (لهجة نجدية بيضاء، "يا طويل العمر"، "سم"، "أبشر"، "على خشمي").
+    - Tone: Confident, warm, energetic, and very concise (Short sentences).
 
-معلومات الطلب:
-- الاسم: {lead_data['customer_name']}
-- الطلب: {lead_data['order_items']}
-- وقت التوصيل: {lead_data['delivery_time']}
+    **THE GOAL:**
+    Your specific goal is to convince the user to agree to a quick **Demo Meeting (عرض تجريبي)** of our platform.
+    - If they agree -> Call the tool `update_lead_status_confirmed`.
+    - If they refuse firmly/hang up -> Call the tool `update_lead_status_cancelled`.
 
-الهدف:
-1) اسأل سؤال تأكيد واضح: هل بتأكد الطلب؟
-2) إذا أكّد: نادِ الدالة update_lead_status_confirmed(reason=...).
-3) إذا لغى: نادِ الدالة update_lead_status_cancelled(reason=...).
-4) إذا الجواب مش واضح: اسأل سؤال واحد توضيحي وبس.
+    **COMPANY INFORMATION (CONTEXT):**
+    - **Product:** Mawsool is a B2B SaaS platform (منصة بيانات).
+    - **Value Proposition:** We provide verified phone numbers and emails for decision-makers (CEOs, Managers) in Saudi Arabia.
+    - **Problem We Solve:** Instead of wasting weeks searching for clients on LinkedIn, we give you direct contact info instantly.
+    - **Accuracy:** Data is updated daily.
 
-قواعد اللغة:
-- لا تحكي إنجليزي إلا إذا العميل حكى إنجليزي.
-- خلي أسماء المنتجات/الأسماء زي ما هي بدون تعريب مبالغ فيه.
-"""
+    **CONVERSATION GUIDELINES:**
+    1.  **Start Natural:** "السلام عليكم، مساك الله بالخير.. معك خالد من شركة موصول، عساك طيب؟" (Wait for reply).
+    2.  **Be Brief:** Do not give long speeches. Speak 1-2 sentences max, then ask a question.
+    3.  **Handle Objections:**
+        - *If "Busy":* "أبشر، ما راح آخذ من وقتك إلا دقيقة.. بس حبيت أخبرك كيف نوفر عليك تعب البحث عن عملاء."
+        - *If "Not Interested":* "أقدر وقتك، بس تخيل توصل لمدراء الشركات بضغطة زر.. ما يستاهل تشوف نظرة سريعة؟"
+        - *If "Send WhatsApp":* "أكيد، بس العرض المباشر يوريك النظام عالواقع أفضل وأسرع. يناسبك بكره؟"
+    4.  **Closing:** Always push gently for a specific time. "وش رايك نرتب الديمو أونلاين بكره الصباح؟"
+
+    **CRITICAL RULES (FIREWALL):**
+    - **NO English:** Even if the user speaks English, reply in Arabic: "المعذرة طال عمرك، ما فهمت عليك زين."
+    - **Ignore Noise:** If you hear static or unintelligible noise, do not say "Are you there?". Just wait or say "ألو؟".
+    - **Speak like a Local:** Never use MSA (Fusha). Don't say "حسناً" or "وداعاً". Say "تمام"، "زين"، "في أمان الله".
+    """
 
     if use_multimodal_live:
         api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
@@ -568,6 +583,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             GeminiLiveLLMService as GeminiLiveService,
             InputParams as GeminiLiveInputParams,
         )
+        # --- NEW IMPORT FOR VAD INTERRUPTION ---
         from pipecat.turns.user_turn_strategies import VADUserTurnStartStrategy
 
         http_api_version = (os.getenv("GEMINI_LIVE_HTTP_API_VERSION") or "v1beta").strip()
@@ -616,27 +632,27 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
         call_end_delay_s = 2.0 
         lead_finalized = {"value": None}
 
-        async def confirm_order(params: FunctionCallParams):
-            logger.info(f"Tool: Confirming Order for {lead_data['id']}")
+        async def confirm_appointment(params: FunctionCallParams):
+            logger.info(f"Tool: Confirming Demo/Appointment for {lead_data['id']}")
             lead_finalized["value"] = "CONFIRMED"
             update_lead_status(lead_data["id"], "CONFIRMED")
-            await params.result_callback({"value": "تم تأكيد الطلب بنجاح"})
+            await params.result_callback({"value": "تم تأكيد الموعد بنجاح"})
             if call_control_id:
                 asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
 
-        async def cancel_order(params: FunctionCallParams):
-            logger.info(f"Tool: Cancelling Order for {lead_data['id']}")
+        async def cancel_appointment(params: FunctionCallParams):
+            logger.info(f"Tool: Cancelling for {lead_data['id']}")
             lead_finalized["value"] = "CANCELLED"
             update_lead_status(lead_data["id"], "CANCELLED")
-            await params.result_callback({"value": "تم إلغاء الطلب"})
+            await params.result_callback({"value": "تم إلغاء الموعد"})
             if call_control_id:
                 asyncio.create_task(hangup_telnyx_call(call_control_id, call_end_delay_s))
 
-        gemini_live.register_function("update_lead_status_confirmed", confirm_order)
-        gemini_live.register_function("update_lead_status_cancelled", cancel_order)
+        gemini_live.register_function("update_lead_status_confirmed", confirm_appointment)
+        gemini_live.register_function("update_lead_status_cancelled", cancel_appointment)
 
         mm_perf = MultimodalPerf()
-        mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ المكالمة حسب التعليمات."}])
+        mm_context = LLMContext(messages=[{"role": "user", "content": "ابدأ المكالمة وقدم نفسك بشكل مختصر ومباشر."}])
 
         user_mute_strategies = []
         mute_first_bot = (os.getenv("MULTIMODAL_MUTE_UNTIL_FIRST_BOT") or "true").lower() == "true"
@@ -649,6 +665,9 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
         stop_timeout_s = 0.6 
         
+        # --- CRITICAL FIX: STRATEGIES ---
+        # 1. Added VADUserTurnStartStrategy -> Triggers on SOUND (Instant)
+        # 2. Kept TranscriptionUserTurnStartStrategy -> Triggers on WORDS (Backup)
         start_strategies = [
             VADUserTurnStartStrategy(vad_analyzer=vad),
             TranscriptionUserTurnStartStrategy(use_interim=True)
@@ -718,7 +737,7 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
             if not call_alive["value"] or did_trigger_initial_run["value"]:
                 return
             did_trigger_initial_run["value"] = True
-            logger.info("Multimodal: client connected - starting Jordan Delivery Bot")
+            logger.info("Multimodal: client connected - starting Saudi Sales Bot")
 
         @transport.event_handler("on_client_disconnected")
         async def _on_client_disconnected(_transport, _client):
@@ -739,3 +758,6 @@ async def run_bot(websocket_client, lead_data, call_control_id=None):
 
     logger.error("USE_MULTIMODAL_LIVE must be true")
     return
+
+
+
